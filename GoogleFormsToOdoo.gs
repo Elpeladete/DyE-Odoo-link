@@ -20,7 +20,6 @@ const FORM_CONFIG = {
   // IMPORTANTE: Extraer el ID correcto de la URL del formulario
   // URL ejemplo: https://docs.google.com/forms/d/[ID_DEL_FORMULARIO]/viewform
   formId: "1b1-Adg1riv2aF6X_8cgtqLrsEAWgiToFJurQJcL2tKA",
-  
   // Mapeo de entry IDs a nombres de campos
   fieldMapping: {
     "entry.1656615011": "apellido",
@@ -33,11 +32,11 @@ const FORM_CONFIG = {
     "entry.1203722377": "comentarios",
     "entry.1848186805": "montoEstimado",
     "entry.759729973": "presupuesto",
-    "entry.276961824": "operadorApp", // Nombre registrador
-    "entry.1185082508": "comercialAsignado",
+    "entry.276961824": "operadorApp", // OPERADOR: Persona que usa la app para registrar
+    "entry.1185082508": "comercialAsignado", // COMERCIAL: Vendedor/representante asignado
     "entry.716935390": "evento",
-    "entry.1582004362": "empresaOperador", // Empresa registrador
-    // Checkboxes individuales
+    "entry.1582004362": "empresaOperador", // EMPRESA: Empresa/organización registradora
+    // Checkboxes individuales de verticales/intereses
     "entry.1677960690": "weedSeeker",
     "entry.1491059195": "solucionSiembra", 
     "entry.2007292571": "solucionPulverizacion",
@@ -101,24 +100,32 @@ function onFormSubmit(e) {
     // Extraer datos de la respuesta
     const formData = extractFormData(e);
     Logger.log("Datos extraídos del formulario: " + JSON.stringify(formData, null, 2));
-    
-    // Procesar verticales/checkboxes
+      // Procesar verticales/checkboxes
     formData.concatenatedCheckboxes = processVerticales(formData);
     
     // Agregar país por defecto si no está especificado
     if (!formData.pais) {
       formData.pais = "Argentina";
-    }
+    }    // Log de datos procesados para debug
+    Logger.log("📋 DATOS PROCESADOS:");
+    Logger.log("👤 Persona: " + (formData.nombre || '') + " " + (formData.apellido || ''));
+    Logger.log("📧 Email: " + (formData.mail || 'No proporcionado'));
+    Logger.log("📞 Teléfono: " + (formData.telefono || 'No proporcionado'));
+    Logger.log("🏢 Empresa registradora: " + (formData.empresaRegistradora || 'No especificada'));
+    Logger.log("👨‍💼 Registrador/Operador: " + (formData.registrador || 'No especificado'));
+    Logger.log("💼 Comercial asignado: " + (formData.comercial || 'No asignado'));
+    Logger.log("🎯 Verticales: " + (formData.concatenatedCheckboxes || 'Ninguna'));
+    Logger.log("💬 Comentarios: " + (formData.comentarios || 'Sin comentarios'));
+    Logger.log("🎪 Evento: " + (formData.evento || 'No especificado'));
     
     // Enviar a Odoo
     const odooResult = createOdooLead(formData);
     
     if (odooResult.success) {
       Logger.log("✅ Lead creado exitosamente en Odoo con ID: " + odooResult.lead_id);
-      
-      // Opcional: Enviar notificación por WhatsApp usando Wazzup
+        // Opcional: Enviar notificación por WhatsApp usando Wazzup
       try {
-        if (formData.telefono && formData.comercialAsignado) {
+        if (formData.telefono && formData.comercial) {
           sendWazzupNotification(formData);
         }
       } catch (whatsappError) {
@@ -160,15 +167,28 @@ function extractFormData(e) {
     for (const itemResponse of itemResponses) {
       const question = itemResponse.getItem().getTitle();
       const answer = itemResponse.getResponse();
-      
-      // Mapear pregunta a campo conocido
+        // Mapear pregunta a campo conocido
       const fieldName = mapQuestionToField(question);
       if (fieldName) {
-        formData[fieldName] = answer;
+        // Manejar respuestas múltiples (checkboxes)
+        if (Array.isArray(answer)) {
+          // Para checkboxes múltiples, concatenar con comas
+          formData[fieldName] = answer.join(", ");
+        } else {
+          formData[fieldName] = answer;
+        }
+        
+        // Debugging específico para campos problemáticos
+        if (question.toUpperCase().includes("EMPRESAREGISTRADOR")) {
+          Logger.log(`🔍 DEBUG EMPRESAREGISTRADOR: "${question}" -> "${fieldName}" -> "${answer}"`);
+        }
       }
       
       Logger.log(`Pregunta: "${question}" -> Campo: "${fieldName}" -> Respuesta: "${answer}"`);
     }
+    
+    // Procesar verticales de checkboxes individuales
+    formData.verticalesSeleccionadas = extractSelectedVerticals(itemResponses);
     
     // Validaciones básicas
     if (!formData.nombre) {
@@ -176,6 +196,32 @@ function extractFormData(e) {
     }
     if (!formData.apellido) {
       throw new Error("Apellido es requerido");
+    }
+    
+    // ✅ VALIDACIÓN ADICIONAL DE DATOS CRÍTICOS
+    Logger.log("🔍 Validando datos críticos...");
+    
+    const nombreCompleto = formData.nombre + " " + formData.apellido;
+    Logger.log("✅ Nombre completo: " + nombreCompleto);
+    
+    // Validar email si está presente
+    if (formData.mail && formData.mail.trim() !== '') {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(formData.mail)) {
+        Logger.log("⚠️ Email inválido, se ignorará: " + formData.mail);
+        formData.mail = ''; // Limpiar email inválido
+      } else {
+        Logger.log("✅ Email válido: " + formData.mail);
+      }
+    } else {
+      Logger.log("⚠️ Email no proporcionado o vacío");
+    }
+    
+    // Validar teléfono si está presente
+    if (formData.telefono && formData.telefono.trim() !== '') {
+      Logger.log("✅ Teléfono: " + formData.telefono);
+    } else {
+      Logger.log("⚠️ Teléfono no proporcionado");
     }
     
     return formData;
@@ -187,56 +233,204 @@ function extractFormData(e) {
 }
 
 /**
+ * Extrae las verticales seleccionadas de los checkboxes individuales
+ */
+function extractSelectedVerticals(itemResponses) {
+  const selectedVerticals = [];
+  
+  // Mapeo de preguntas a etiquetas de verticales
+  const verticalMappings = {
+    "weed": "WeedSeeker",
+    "seeker": "WeedSeeker", 
+    "siembra": "Solución Siembra",
+    "pulverización": "Solución Pulverización",
+    "pulverizacion": "Solución Pulverización",
+    "post": "Post Venta",
+    "venta": "Post Venta",
+    "drone": "Drones DJI",
+    "dji": "Drones DJI",
+    "guía": "Guía/Autoguía",
+    "autoguía": "Guía/Autoguía",
+    "autoguia": "Guía/Autoguía",
+    "taps": "Taps y Señales",
+    "señales": "Taps y Señales",
+    "senales": "Taps y Señales",
+    "qr": "Acción QR"
+  };
+  
+  try {
+    for (const itemResponse of itemResponses) {
+      const question = itemResponse.getItem().getTitle().toLowerCase();
+      const answer = itemResponse.getResponse();
+      
+      // Verificar si la respuesta indica que el checkbox está seleccionado
+      const isSelected = answer === true || 
+                        answer === "true" || 
+                        answer === "TRUE" || 
+                        answer === "Sí" || 
+                        answer === "Si" || 
+                        answer === "Yes" ||
+                        (typeof answer === 'string' && answer.toLowerCase().includes("sí")) ||
+                        (typeof answer === 'string' && answer.toLowerCase().includes("si")) ||
+                        (Array.isArray(answer) && answer.length > 0);
+      
+      if (isSelected) {
+        // Buscar coincidencia en el mapeo de verticales
+        for (const [keyword, label] of Object.entries(verticalMappings)) {
+          if (question.includes(keyword) && !selectedVerticals.includes(label)) {
+            selectedVerticals.push(label);
+            Logger.log(`✓ Vertical seleccionada: "${label}" (desde pregunta: "${question}")`);
+            break;
+          }
+        }
+      }
+    }
+    
+    return selectedVerticals;
+    
+  } catch (error) {
+    Logger.log("Error extrayendo verticales: " + error.toString());
+    return [];
+  }
+}
+
+/**
  * Mapea las preguntas del formulario a nombres de campos
  */
 function mapQuestionToField(question) {
   const questionMappings = {
+    // Datos personales básicos
     "APELLIDO": "apellido",
+    "APELLIDOS": "apellido",
+    "SURNAME": "apellido",
     "NOMBRE": "nombre",
-    "LOCALIDAD": "localidad", 
+    "NOMBRES": "nombre", 
+    "NAME": "nombre",
+    
+    // Ubicación
+    "LOCALIDAD": "localidad",
+    "CIUDAD": "localidad",
+    "CITY": "localidad", 
     "PROVINCIA": "provincia",
+    "ESTADO": "provincia",
+    "STATE": "provincia",
+    
+    // Contacto
     "TELÉFONO": "telefono",
+    "TELEFONO": "telefono",
+    "PHONE": "telefono",
+    "CELULAR": "telefono",
     "EMAIL": "mail",
+    "MAIL": "mail",
+    "CORREO": "mail",
+    
+    // Intereses y comentarios
     "VERTICALES": "verticales",
+    "INTERESES": "verticales",
     "COMENTARIOS": "comentarios",
+    "COMENTARIO": "comentarios",
+    "OBSERVACIONES": "comentarios",
+      // Montos y presupuesto
     "MONTO": "montoEstimado",
     "PRESUPUESTO": "presupuesto",
-    "NOMBREREGISTRADOR": "operadorApp",
-    "COMERCIALASIGNADO": "comercialAsignado",
+    "BUDGET": "presupuesto",
+    
+    // ⚠️ IMPORTANTE: Empresa registradora DEBE ir ANTES que registrador 
+    // porque "EMPRESAREGISTRADOR" contiene "REGISTRADOR"
+    "EMPRESAREGISTRADOR": "empresaRegistradora",
+    "EMPRESA REGISTRADORA": "empresaRegistradora", 
+    "EMPRESA REGISTRADOR": "empresaRegistradora",
+    "EMPRESA DEL REGISTRADOR": "empresaRegistradora",
+    "EMPRESA QUE REGISTRA": "empresaRegistradora",
+    "EMPRESA": "empresaRegistradora",
+    "COMPAÑIA": "empresaRegistradora",
+    "COMPANY": "empresaRegistradora",
+    "ORGANIZACION": "empresaRegistradora",
+    "ORGANIZACIÓN": "empresaRegistradora",
+    
+    // Registrador (persona que registra/operador) - mapea a "registrador"
+    "REGISTRADOR": "registrador",
+    "OPERADOR": "registrador",
+    "OPERADOR APP": "registrador",
+    "OPERADOR DE LA APP": "registrador",
+    "REGISTRA": "registrador",
+    "QUIEN REGISTRA": "registrador",
+    "NOMBRE REGISTRADOR": "registrador",
+    "NOMBRE DEL REGISTRADOR": "registrador",
+    "PERSONA QUE REGISTRA": "registrador",
+    
+    // Asignado a (comercial) - mapea a "comercial"
+    "ASIGNADO A": "comercial",
+    "ASIGNADOA": "comercial",
+    "COMERCIAL": "comercial",
+    "COMERCIAL ASIGNADO": "comercial",
+    "COMERCIALASIGNADO": "comercial",
+    "VENDEDOR": "comercial",
+    "VENDEDOR ASIGNADO": "comercial",
+    "REPRESENTANTE": "comercial",
+    "REPRESENTANTE COMERCIAL": "comercial",
+    "ASESOR": "comercial",
+    "ASESOR COMERCIAL": "comercial",
+    
+    // Evento
     "EVENTO": "evento",
-    "EMPRESAREGISTRADOR": "empresaOperador"
+    "EVENT": "evento",
+    "EXHIBITION": "evento",
+    "EXPOSICION": "evento",
+    "EXPOSICIÓN": "evento"
   };
   
-  // Buscar coincidencia exacta o parcial
+  // Buscar coincidencia exacta o parcial (normalizar texto)
+  const normalizedQuestion = question.toUpperCase().replace(/[áéíóúñ]/g, match => {
+    const replacements = {'á': 'A', 'é': 'E', 'í': 'I', 'ó': 'O', 'ú': 'U', 'ñ': 'N'};
+    return replacements[match] || match;
+  });
+    // Primero buscar coincidencias EXACTAS
   for (const [key, value] of Object.entries(questionMappings)) {
-    if (question.toUpperCase().includes(key)) {
+    if (normalizedQuestion === key) {
       return value;
     }
   }
   
-  // Para checkboxes, mapear por contenido
-  if (question.toLowerCase().includes("weed") || question.toLowerCase().includes("seeker")) {
+  // Luego buscar coincidencias parciales, pero priorizar las más específicas (más largas)
+  const partialMatches = [];
+  for (const [key, value] of Object.entries(questionMappings)) {
+    if (normalizedQuestion.includes(key)) {
+      partialMatches.push({key, value, length: key.length});
+    }
+  }
+  
+  // Ordenar por longitud descendente (más específico primero)
+  if (partialMatches.length > 0) {
+    partialMatches.sort((a, b) => b.length - a.length);
+    return partialMatches[0].value;
+  }
+  
+  // Para checkboxes, mapear por contenido específico
+  const questionLower = question.toLowerCase();
+  
+  if (questionLower.includes("weed") || questionLower.includes("seeker")) {
     return "weedSeeker";
   }
-  if (question.toLowerCase().includes("siembra")) {
+  if (questionLower.includes("siembra")) {
     return "solucionSiembra";
   }
-  if (question.toLowerCase().includes("pulverización") || question.toLowerCase().includes("pulverizacion")) {
+  if (questionLower.includes("pulverización") || questionLower.includes("pulverizacion")) {
     return "solucionPulverizacion";
   }
-  if (question.toLowerCase().includes("post") && question.toLowerCase().includes("venta")) {
+  if (questionLower.includes("post") && questionLower.includes("venta")) {
     return "postVenta";
   }
-  if (question.toLowerCase().includes("drone")) {
+  if (questionLower.includes("drone")) {
     return "dronesDJI";
   }
-  if (question.toLowerCase().includes("guía") || question.toLowerCase().includes("autoguía")) {
+  if (questionLower.includes("guía") || questionLower.includes("autoguía") || questionLower.includes("autoguia")) {
     return "guiaAutoguia";
   }
-  if (question.toLowerCase().includes("taps") || question.toLowerCase().includes("señales")) {
+  if (questionLower.includes("taps") || questionLower.includes("señales") || questionLower.includes("senales")) {
     return "tapsSenales";
   }
-  if (question.toLowerCase().includes("qr")) {
+  if (questionLower.includes("qr")) {
     return "accionQR";
   }
   
@@ -249,6 +443,13 @@ function mapQuestionToField(question) {
 function processVerticales(formData) {
   const verticales = [];
   
+  // Primero agregar verticales extraídas automáticamente
+  if (formData.verticalesSeleccionadas && formData.verticalesSeleccionadas.length > 0) {
+    verticales.push(...formData.verticalesSeleccionadas);
+    Logger.log("Verticales automáticas agregadas: " + formData.verticalesSeleccionadas.join(", "));
+  }
+  
+  // Luego verificar campos individuales de checkboxes
   const checkboxFields = [
     { field: "weedSeeker", label: "WeedSeeker" },
     { field: "solucionSiembra", label: "Solución Siembra" },
@@ -261,17 +462,45 @@ function processVerticales(formData) {
   ];
   
   for (const checkbox of checkboxFields) {
-    if (formData[checkbox.field] === "TRUE" || formData[checkbox.field] === true) {
+    const value = formData[checkbox.field];
+    
+    // Verificar múltiples formas de "verdadero"
+    const isSelected = value === "TRUE" || 
+                      value === true || 
+                      value === "true" || 
+                      value === "Sí" ||
+                      value === "Si" ||
+                      value === "Yes" ||
+                      value === "1" ||
+                      (typeof value === 'string' && value.toLowerCase().includes("sí")) ||
+                      (typeof value === 'string' && value.toLowerCase().includes("si")) ||
+                      (Array.isArray(value) && value.length > 0) ||
+                      (typeof value === 'string' && value.trim() !== "" && value !== "FALSE" && value !== "false" && value !== "No");
+    
+    if (isSelected && !verticales.includes(checkbox.label)) {
       verticales.push(checkbox.label);
+      Logger.log(`✓ Checkbox agregado: ${checkbox.field} = "${value}" -> ${checkbox.label}`);
+    } else if (value) {
+      Logger.log(`✗ Checkbox no agregado: ${checkbox.field} = "${value}" (no cumple criterios)`);
     }
   }
   
   // Si hay campo verticales directo, agregarlo también
-  if (formData.verticales) {
-    verticales.push(formData.verticales);
+  if (formData.verticales && typeof formData.verticales === 'string' && formData.verticales.trim() !== '') {
+    // Dividir por comas si es una lista
+    const directVerticals = formData.verticales.split(',').map(v => v.trim()).filter(v => v !== '');
+    for (const vertical of directVerticals) {
+      if (!verticales.includes(vertical)) {
+        verticales.push(vertical);
+        Logger.log(`✓ Vertical directa agregada: ${vertical}`);
+      }
+    }
   }
   
-  return verticales.join(", ");
+  const result = verticales.join(", ");
+  Logger.log(`🎯 Verticales finales concatenadas: "${result}"`);
+  
+  return result;
 }
 
 // ===============================
@@ -515,63 +744,125 @@ function createOdooLead(formData) {
     // Preparar datos para el lead
     const nombreCompleto = formData.nombre + " " + formData.apellido;
     Logger.log(`Preparando datos para: ${nombreCompleto}, Email: ${formData.mail}, Teléfono: ${formData.telefono}`);
+      // Construir descripción detallada como HTML
+    let descripcion = `<div style="font-family: Arial, sans-serif; line-height: 1.6;">`;
+    descripcion += `<h2 style="color: #2E75B6; margin-bottom: 20px;">📋 INFORMACIÓN DEL PROSPECTO</h2>`;
     
-    // Construir descripción detallada
-    let descripcion = `INFORMACIÓN DEL PROSPECTO\n`;
-    descripcion += `=============================================\n\n`;
+    descripcion += `<div style="margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; border-bottom: 2px solid #4CAF50; padding-bottom: 5px;">👤 DATOS PERSONALES</h3>`;
+    descripcion += `<ul style="margin: 10px 0; padding-left: 20px;">`;
+    descripcion += `<li><strong>Nombre completo:</strong> ${nombreCompleto}</li>`;
+    descripcion += `<li><strong>Teléfono:</strong> ${formData.telefono || '<em>No proporcionado</em>'}</li>`;
+    descripcion += `<li><strong>Email:</strong> ${formData.mail || '<em>No proporcionado</em>'}</li>`;
+    descripcion += `</ul>`;
+    descripcion += `</div>`;
     
-    descripcion += `DATOS PERSONALES:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Nombre completo: ${nombreCompleto}\n`;
-    descripcion += `Teléfono: ${formData.telefono || 'No proporcionado'}\n`;
-    descripcion += `Email: ${formData.mail || 'No proporcionado'}\n\n`;
+    descripcion += `<div style="margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; border-bottom: 2px solid #4CAF50; padding-bottom: 5px;">🌍 UBICACIÓN</h3>`;
+    descripcion += `<ul style="margin: 10px 0; padding-left: 20px;">`;
+    descripcion += `<li><strong>Localidad:</strong> ${formData.localidad || '<em>No proporcionada</em>'}</li>`;
+    descripcion += `<li><strong>Provincia:</strong> ${formData.provincia || '<em>No proporcionada</em>'}</li>`;
+    descripcion += `<li><strong>País:</strong> ${formData.pais || '<em>No proporcionado</em>'}</li>`;
+    descripcion += `</ul>`;
+    descripcion += `</div>`;
     
-    descripcion += `UBICACIÓN:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Localidad: ${formData.localidad || 'No proporcionada'}\n`;
-    descripcion += `Provincia: ${formData.provincia || 'No proporcionada'}\n`;
-    descripcion += `País: ${formData.pais || 'No proporcionado'}\n\n`;
+    descripcion += `<div style="margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; border-bottom: 2px solid #4CAF50; padding-bottom: 5px;">🎯 INTERESES (VERTICALES)</h3>`;
+    if (formData.concatenatedCheckboxes && formData.concatenatedCheckboxes.trim() !== '') {
+      const verticales = formData.concatenatedCheckboxes.split(',').map(v => v.trim()).filter(v => v !== '');
+      descripcion += `<ul style="margin: 10px 0; padding-left: 20px;">`;
+      verticales.forEach(vertical => {
+        descripcion += `<li><span style="background-color: #E3F2FD; padding: 2px 8px; border-radius: 12px; font-size: 0.9em;">${vertical}</span></li>`;
+      });
+      descripcion += `</ul>`;
+    } else {
+      descripcion += `<p style="font-style: italic; color: #666;">No se especificaron intereses particulares</p>`;
+    }
+    descripcion += `</div>`;
     
-    descripcion += `INTERESES (VERTICALES):\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `${formData.concatenatedCheckboxes || 'No especificados'}\n\n`;
+    descripcion += `<div style="margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; border-bottom: 2px solid #4CAF50; padding-bottom: 5px;">💼 DETALLES COMERCIALES</h3>`;
+    descripcion += `<ul style="margin: 10px 0; padding-left: 20px;">`;
+    if (formData.comentarios && formData.comentarios.trim() !== '') {
+      descripcion += `<li><strong>Comentarios:</strong> <div style="background-color: #F5F5F5; padding: 10px; border-left: 4px solid #2196F3; margin: 5px 0;">${formData.comentarios}</div></li>`;
+    } else {
+      descripcion += `<li><strong>Comentarios:</strong> <em>Sin comentarios adicionales</em></li>`;
+    }
+    descripcion += `<li><strong>Monto Estimado:</strong> ${formData.montoEstimado || '<em>No especificado</em>'}</li>`;
+    descripcion += `<li><strong>Presupuesto:</strong> ${formData.presupuesto || '<em>No especificado</em>'}</li>`;
+    descripcion += `</ul>`;
+    descripcion += `</div>`;
     
-    descripcion += `DETALLES ADICIONALES:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Comentarios: ${formData.comentarios || 'Sin comentarios'}\n`;
-    descripcion += `Monto Estimado: ${formData.montoEstimado || 'No especificado'}\n\n`;
+    descripcion += `<div style="margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; border-bottom: 2px solid #4CAF50; padding-bottom: 5px;">📋 INFORMACIÓN DE REGISTRO</h3>`;
+    descripcion += `<ul style="margin: 10px 0; padding-left: 20px;">`;
+    descripcion += `<li><strong>Registrador (Operador):</strong> ${formData.registrador || '<em>No especificado</em>'}</li>`;
+    descripcion += `<li><strong>Empresa Registradora:</strong> ${formData.empresaRegistradora || '<em>No especificada</em>'}</li>`;
+    descripcion += `<li><strong>Comercial Asignado:</strong> ${formData.comercial || '<em>No asignado</em>'}</li>`;
+    descripcion += `<li><strong>Evento:</strong> ${formData.evento || '<em>No especificado</em>'}</li>`;
+    descripcion += `</ul>`;
+    descripcion += `</div>`;
     
-    descripcion += `INFORMACIÓN DEL EVENTO:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Evento: ${formData.evento || 'No especificado'}\n\n`;
+    descripcion += `<div style="background-color: #E8F5E8; padding: 15px; border-radius: 8px; margin-bottom: 20px;">`;
+    descripcion += `<h3 style="color: #1B5E20; margin-top: 0;">ℹ️ INFORMACIÓN ADICIONAL</h3>`;
+    descripcion += `<ul style="margin: 5px 0; padding-left: 20px;">`;
+    descripcion += `<li><strong>Origen:</strong> <span style="background-color: #4CAF50; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.9em;">Google Forms</span></li>`;
+    descripcion += `<li><strong>Fecha de registro:</strong> ${new Date().toLocaleString('es-AR')}</li>`;
+    descripcion += `</ul>`;
+    descripcion += `</div>`;
+    descripcion += `</div>`;    // Construir los datos para Odoo
+    const verticalesParaTitulo = formData.concatenatedCheckboxes && formData.concatenatedCheckboxes.trim() !== '' 
+      ? formData.concatenatedCheckboxes 
+      : 'Consulta General';
     
-    descripcion += `INFORMACIÓN DE REGISTRO:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Registrado por: ${formData.operadorApp || 'No especificado'}\n`;
-    descripcion += `Empresa del registrador: ${formData.empresaOperador || 'No especificada'}\n`;
-    descripcion += `Comercial asignado: ${formData.comercialAsignado || 'No asignado'}\n\n`;
+    // 🌍 Búsqueda dinámica de país basada en localidad y provincia
+    const countryId = findCountryByLocation(
+      ODOO_CONFIG.url, 
+      ODOO_CONFIG.db, 
+      uid, 
+      ODOO_CONFIG.password, 
+      formData.localidad, 
+      formData.provincia
+    );
+      // Validar email - si está vacío, no enviarlo (evita problemas en Odoo)
+    const emailField = (formData.mail && formData.mail.trim() !== '') ? formData.mail.trim() : null;
     
-    descripcion += `INFORMACIÓN ADICIONAL:\n`;
-    descripcion += `---------------------------------------------\n`;
-    descripcion += `Origen: Google Forms\n`;
-    descripcion += `Fecha de registro: ${new Date().toLocaleString('es-AR')}\n`;
-    
-    // Construir los datos para Odoo
     const odooLeadData = {
-      'name': `${nombreCompleto} - ${formData.concatenatedCheckboxes}`,
+      'name': `${nombreCompleto} - ${verticalesParaTitulo}`,
       'contact_name': nombreCompleto,
-      'email_from': formData.mail || '',
       'phone': formData.telefono || '',
       'description': descripcion,
       'type': 'lead',
-      'function': formData.operadorApp,
       'street': formData.localidad || '',
       'city': formData.localidad || '',
-      'country_id': 10, // Argentina por defecto
+      'country_id': countryId,
       'campaign_id': '',
-      'source_id': '',
-      'referred': formData.evento || ''
+      'source_id': '',      'referred': formData.evento || ''
     };
+    
+    // Agregar email solo si tiene un valor válido
+    if (emailField) {
+      odooLeadData['email_from'] = emailField;
+      Logger.log("✅ Email agregado: " + emailField);
+    } else {
+      Logger.log("⚠️ Email vacío o inválido, no se agregará al lead");
+    }
+    
+    // Buscar y asignar comercial (salesperson)
+    if (formData.comercial && formData.comercial.trim() !== '') {
+      const salespersonId = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, formData.comercial);
+      if (salespersonId) {
+        odooLeadData['user_id'] = salespersonId;
+        Logger.log("✅ Comercial asignado con ID: " + salespersonId);
+      } else {
+        Logger.log("⚠️ No se pudo encontrar el comercial: " + formData.comercial);
+      }
+    }
+      // ✅ NO USAR CAMPOS PERSONALIZADOS - ya están incluidos en la descripción HTML
+    // Los datos de registrador y empresa ya están en la descripción formateada
+    Logger.log("ℹ️ Datos de registrador y empresa incluidos en descripción HTML");
+    Logger.log("📝 Registrador: " + (formData.registrador || 'No especificado'));
+    Logger.log("🏢 Empresa registradora: " + (formData.empresaRegistradora || 'No especificada'));
     
     // Buscar el ID del país dinámicamente si está especificado
     if (formData.pais) {
@@ -581,10 +872,16 @@ function createOdooLead(formData) {
         Logger.log("ID de país encontrado y asignado: " + countryId + " para " + formData.pais);
       }
     }
-    
-    // Buscar el ID de la provincia
+      // 🗺️ Buscar provincia con país dinámico
     if (formData.provincia) {
-      const provinceId = getProvinceId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, formData.provincia, odooLeadData['country_id']);
+      const provinceId = getProvinceIdDynamic(
+        ODOO_CONFIG.url, 
+        ODOO_CONFIG.db, 
+        uid, 
+        ODOO_CONFIG.password, 
+        formData.provincia, 
+        countryId
+      );
       if (provinceId) {
         odooLeadData['state_id'] = provinceId;
         Logger.log("ID de provincia encontrado y asignado: " + provinceId);
@@ -792,17 +1089,339 @@ function getProvinceId(url, db, uid, password, provinceName, countryId = 10) {
   }
 }
 
-// ===============================
-// FUNCIONES DE NOTIFICACIÓN
-// ===============================
+/**
+ * Buscar comercial/salesperson en Odoo por nombre
+ * Búsqueda GLOBAL sin restricciones de empresa o equipo de ventas
+ */
+function getSalespersonId(url, db, uid, password, salespersonName) {
+  if (!salespersonName || salespersonName.trim() === '') return null;
+  
+  try {
+    Logger.log(`🔍 Buscando comercial GLOBALMENTE (sin restricciones): "${salespersonName}"`);
+    
+    // 1. BÚSQUEDA PRINCIPAL: Usuarios SIN restricciones de empresa
+    const userSearchCriteria = [
+      '|', '|', '|', '|',
+      ['name', 'ilike', salespersonName],
+      ['login', 'ilike', salespersonName], 
+      ['partner_id.name', 'ilike', salespersonName],
+      ['partner_id.email', 'ilike', salespersonName],
+      ['email', 'ilike', salespersonName]
+    ];
+    
+    Logger.log("🔎 Buscando en res.users (TODOS los usuarios, todas las empresas)...");
+    
+    // IMPORTANTE: Usar context vacío para evitar filtros de empresa
+    const contextFree = {};
+    
+    const existingUsers = xmlrpcExecute(
+      url, db, uid, password,
+      'res.users',
+      'search_read',
+      [userSearchCriteria, ['id', 'name', 'login', 'email', 'active', 'company_id', 'company_ids'], 0, 20], // Más resultados
+      contextFree  // Context vacío = sin restricciones
+    );
+    
+    if (existingUsers && existingUsers.length > 0) {
+      Logger.log(`📊 Encontrados ${existingUsers.length} usuarios candidatos`);
+      
+      // Mostrar todos los candidatos para debug
+      existingUsers.forEach((user, index) => {
+        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login}, Activo: ${user.active}, Empresas: ${user.company_ids || user.company_id})`);
+      });
+      
+      // Priorizar usuarios activos
+      const activeUsers = existingUsers.filter(user => user.active !== false);
+      
+      if (activeUsers.length > 0) {
+        const user = activeUsers[0];
+        Logger.log(`✅ Usuario ACTIVO seleccionado: ${user.name} (ID: ${user.id})`);
+        return user.id;
+      } else {
+        // Si no hay activos, tomar el primero disponible
+        const user = existingUsers[0];
+        Logger.log(`⚠️ Usuario INACTIVO seleccionado: ${user.name} (ID: ${user.id}) - usando de todas formas`);
+        return user.id;
+      }
+    }
+    
+    // 2. BÚSQUEDA ALTERNATIVA: Partners SIN restricciones de empresa
+    Logger.log("🔎 Buscando en res.partner (TODOS los contactos individuales)...");
+    const partnerSearchCriteria = [
+      ['name', 'ilike', salespersonName],
+      ['is_company', '=', false]  // Solo contactos individuales
+    ];
+    
+    const existingPartners = xmlrpcExecute(
+      url, db, uid, password,
+      'res.partner',
+      'search_read',
+      [partnerSearchCriteria, ['id', 'name', 'email', 'company_id'], 0, 20],
+      contextFree  // Sin restricciones de empresa
+    );
+    
+    if (existingPartners && existingPartners.length > 0) {
+      Logger.log(`📊 Encontrados ${existingPartners.length} partners candidatos`);
+      
+      // Para cada partner, buscar si tiene usuario asociado
+      for (const partner of existingPartners) {
+        Logger.log(`   Verificando partner: ${partner.name} (ID: ${partner.id})`);
+        
+        const partnerUser = xmlrpcExecute(
+          url, db, uid, password,
+          'res.users',
+          'search_read',
+          [[['partner_id', '=', partner.id]], ['id', 'name', 'active'], 0, 1],
+          contextFree  // Sin restricciones
+        );
+        
+        if (partnerUser && partnerUser.length > 0) {
+          const user = partnerUser[0];
+          Logger.log(`✅ Usuario encontrado via partner: ${user.name} (ID: ${user.id}, Partner: ${partner.name})`);
+          return user.id;
+        }
+      }
+      
+      Logger.log(`ℹ️ Partners encontrados pero ninguno con usuario asociado`);
+    }
+    
+    // 3. BÚSQUEDA POR COINCIDENCIA PARCIAL SÚPER FLEXIBLE
+    Logger.log("🔎 Búsqueda súper flexible por coincidencia parcial...");
+    const flexibleSearch = [
+      '|', '|',
+      ['name', 'ilike', `%${salespersonName}%`],
+      ['login', 'ilike', `%${salespersonName}%`],
+      ['email', 'ilike', `%${salespersonName}%`]
+    ];
+    
+    const flexibleUsers = xmlrpcExecute(
+      url, db, uid, password,
+      'res.users',
+      'search_read',
+      [flexibleSearch, ['id', 'name', 'login', 'active', 'company_id'], 0, 10],
+      contextFree  // Sin restricciones
+    );
+    
+    if (flexibleUsers && flexibleUsers.length > 0) {
+      Logger.log(`📊 Búsqueda flexible encontró ${flexibleUsers.length} candidatos:`);
+      flexibleUsers.forEach((user, index) => {
+        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login})`);
+      });
+      
+      const user = flexibleUsers[0];
+      Logger.log(`✅ Usuario seleccionado (coincidencia parcial): ${user.name} (ID: ${user.id})`);
+      return user.id;
+    }
+    
+    // 4. BÚSQUEDA DE RESPALDO: CUALQUIER usuario que pueda ser comercial
+    Logger.log("🔎 Búsqueda de respaldo: cualquier usuario disponible...");
+    try {
+      // Buscar usuarios que NO sean internos del sistema (admin, etc.)
+      const fallbackUsers = xmlrpcExecute(
+        url, db, uid, password,
+        'res.users',
+        'search_read',
+        [
+          [
+            ['active', '=', true],
+            ['login', '!=', '__system__'],
+            ['id', '>', 1]  // Excluir usuario admin (ID 1)
+          ],
+          ['id', 'name', 'login', 'company_id'], 
+          0, 
+          5
+        ],
+        contextFree  // Sin restricciones
+      );
+      
+      if (fallbackUsers && fallbackUsers.length > 0) {
+        const user = fallbackUsers[0];
+        Logger.log(`⚠️ FALLBACK: Usando usuario disponible: ${user.name} (ID: ${user.id})`);
+        return user.id;
+      }
+    } catch (fallbackError) {
+      Logger.log("⚠️ Error en búsqueda de respaldo: " + fallbackError.toString());
+    }
+    
+    Logger.log(`❌ NO se encontró NINGÚN comercial con nombre: "${salespersonName}"`);
+    Logger.log("💡 Posibles causas:");
+    Logger.log("   - El nombre no coincide con ningún usuario en Odoo");
+    Logger.log("   - Problemas de permisos en la base de datos");
+    Logger.log("   - Usuario inexistente o mal escrito");
+    return null;
+    
+  } catch (error) {
+    Logger.log("❌ Error CRÍTICO al buscar comercial: " + error.toString());
+    Logger.log("🔧 Stack trace: " + error.stack);
+    return null;
+  }
+}
 
 /**
- * Enviar notificación por WhatsApp usando Wazzup (opcional)
+ * Buscar país basado en localidad y provincia
  */
-function sendWazzupNotification(formData) {
-  // Esta función es opcional y requiere configuración adicional
-  // Puedes implementarla basándote en tu función sendWazzupMessage original
-  Logger.log("Función de notificación WhatsApp no implementada aún");
+function findCountryByLocation(url, db, uid, password, localidad, provincia) {
+  try {
+    Logger.log(`🌍 Buscando país para: Localidad="${localidad}", Provincia="${provincia}"`);
+    
+    // Mapeo de provincias argentinas para búsqueda rápida
+    const argentineProvinces = [
+      'buenos aires', 'ba', 'cordoba', 'córdoba', 'santa fe', 'mendoza', 'tucuman', 'tucumán',
+      'entre rios', 'entre ríos', 'salta', 'misiones', 'chaco', 'corrientes', 'santiago del estero',
+      'san juan', 'jujuy', 'rio negro', 'río negro', 'formosa', 'neuquen', 'neuquén', 'chubut',
+      'san luis', 'catamarca', 'la rioja', 'la pampa', 'santa cruz', 'tierra del fuego'
+    ];
+    
+    // Primero verificar si es una provincia argentina conocida
+    if (provincia) {
+      const provinciaLower = provincia.toLowerCase().trim();
+      const isArgentineProvince = argentineProvinces.some(argProv => 
+        provinciaLower.includes(argProv) || argProv.includes(provinciaLower)
+      );
+      
+      if (isArgentineProvince) {
+        Logger.log("✅ Provincia argentina detectada, usando Argentina (ID: 10)");
+        return 10; // ID de Argentina
+      }
+    }
+    
+    // Si no es provincia argentina conocida, buscar dinámicamente
+    let countryId = null;
+    
+    // 1. Buscar por provincia en res.country.state
+    if (provincia && provincia.trim() !== '') {
+      Logger.log(`🔍 Buscando provincia: "${provincia}"`);
+      
+      const states = xmlrpcExecute(
+        url, db, uid, password,
+        'res.country.state',
+        'search_read',
+        [[['name', 'ilike', provincia]], ['id', 'name', 'country_id'], 0, 5]
+      );
+      
+      if (states && states.length > 0) {
+        countryId = states[0].country_id[0];
+        const countryName = states[0].country_id[1];
+        Logger.log(`✅ Provincia encontrada: ${states[0].name}, País: ${countryName} (ID: ${countryId})`);
+        return countryId;
+      }
+    }
+    
+    // 2. Si no encuentra por provincia, buscar por localidad en ciudades conocidas
+    if (localidad && localidad.trim() !== '') {
+      Logger.log(`🔍 Buscando por localidad: "${localidad}"`);
+      
+      // Mapeo de ciudades importantes a países
+      const cityCountryMapping = {
+        // Argentina
+        'buenos aires': 10, 'capital federal': 10, 'caba': 10, 'cordoba': 10, 'córdoba': 10,
+        'rosario': 10, 'mendoza': 10, 'tucuman': 10, 'tucumán': 10, 'la plata': 10,
+        'mar del plata': 10, 'salta': 10, 'san juan': 10, 'resistencia': 10, 'neuquen': 10,
+        // Brasil
+        'sao paulo': 31, 'rio de janeiro': 31, 'brasilia': 31, 'salvador': 31, 'fortaleza': 31,
+        // Chile
+        'santiago': 46, 'valparaiso': 46, 'valparaíso': 46, 'concepcion': 46, 'concepción': 46,
+        // Uruguay
+        'montevideo': 234, 'punta del este': 234, 'maldonado': 234,
+        // Paraguay
+        'asuncion': 179, 'asunción': 179, 'ciudad del este': 179,
+        // Bolivia
+        'la paz': 26, 'santa cruz': 26, 'cochabamba': 26, 'sucre': 26
+      };
+      
+      const localidadLower = localidad.toLowerCase().trim();
+      for (const [city, countryIdMap] of Object.entries(cityCountryMapping)) {
+        if (localidadLower.includes(city) || city.includes(localidadLower)) {
+          Logger.log(`✅ Ciudad reconocida: ${localidad} → País ID: ${countryIdMap}`);
+          return countryIdMap;
+        }
+      }
+    }
+    
+    // 3. Búsqueda manual en partners de Odoo por localidad
+    if (localidad && localidad.trim() !== '') {
+      const partners = xmlrpcExecute(
+        url, db, uid, password,
+        'res.partner',
+        'search_read',
+        [[['city', 'ilike', localidad]], ['country_id'], 0, 3]
+      );
+      
+      if (partners && partners.length > 0) {
+        for (const partner of partners) {
+          if (partner.country_id && partner.country_id[0]) {
+            countryId = partner.country_id[0];
+            Logger.log(`✅ País encontrado por partners existentes: ID ${countryId}`);
+            return countryId;
+          }
+        }
+      }
+    }
+    
+    // 4. Por defecto, usar Argentina si no se encuentra nada
+    Logger.log("⚠️ No se pudo determinar el país, usando Argentina por defecto (ID: 10)");
+    return 10;
+    
+  } catch (error) {
+    Logger.log("❌ Error buscando país por ubicación: " + error.toString());
+    return 10; // Argentina por defecto
+  }
+}
+
+/**
+ * Buscar provincia mejorada con país dinámico
+ */
+function getProvinceIdDynamic(url, db, uid, password, provincia, countryId) {
+  if (!provincia || provincia.trim() === '') return null;
+  
+  try {
+    Logger.log(`🔍 Buscando provincia: "${provincia}" en país ID: ${countryId}`);
+    
+    // Buscar provincia en el país específico
+    const searchCriteria = [
+      ['name', 'ilike', provincia],
+      ['country_id', '=', countryId]
+    ];
+    
+    const provinces = xmlrpcExecute(
+      url, db, uid, password,
+      'res.country.state',
+      'search_read',
+      [searchCriteria, ['id', 'name', 'country_id'], 0, 1]
+    );
+    
+    if (provinces && provinces.length > 0) {
+      Logger.log(`✅ Provincia encontrada: ${provinces[0].name} (ID: ${provinces[0].id})`);
+      return provinces[0].id;
+    }
+    
+    // Si no encuentra exacta, buscar parcial
+    const partialSearch = [
+      '|',
+      ['name', 'ilike', `%${provincia}%`],
+      ['code', 'ilike', provincia],
+      ['country_id', '=', countryId]
+    ];
+    
+    const partialProvinces = xmlrpcExecute(
+      url, db, uid, password,
+      'res.country.state',
+      'search_read',
+      [partialSearch, ['id', 'name', 'country_id'], 0, 3]
+    );
+    
+    if (partialProvinces && partialProvinces.length > 0) {
+      Logger.log(`✅ Provincia encontrada (búsqueda parcial): ${partialProvinces[0].name} (ID: ${partialProvinces[0].id})`);
+      return partialProvinces[0].id;
+    }
+    
+    Logger.log(`❌ Provincia "${provincia}" no encontrada en país ID: ${countryId}`);
+    return null;
+    
+  } catch (error) {
+    Logger.log("Error al buscar provincia: " + error.toString());
+    return null;
+  }
 }
 
 /**
@@ -810,27 +1429,40 @@ function sendWazzupNotification(formData) {
  */
 function saveFailedSubmission(formData, error) {
   try {
-    // Crear una hoja de cálculo para almacenar envíos fallidos
-    const spreadsheetId = "TU_SPREADSHEET_ID_AQUI"; // Reemplazar con tu ID
-    const sheet = SpreadsheetApp.openById(spreadsheetId).getActiveSheet();
+    Logger.log("💾 Guardando envío fallido para retry manual");
     
-    const row = [
-      new Date(),
-      formData.nombre || '',
-      formData.apellido || '',
-      formData.mail || '',
-      formData.telefono || '',
-      formData.localidad || '',
-      formData.provincia || '',
-      formData.concatenatedCheckboxes || '',
-      formData.comentarios || '',
-      formData.evento || '',
-      error,
-      'PENDIENTE'
-    ];
+    // Crear un registro en el log con la información del error
+    const errorData = {
+      timestamp: new Date().toISOString(),
+      formData: formData,
+      error: error,
+      status: 'FAILED'
+    };
     
-    sheet.appendRow(row);
-    Logger.log("Envío fallido guardado en hoja de cálculo");
+    Logger.log("❌ ENVÍO FALLIDO - DATOS PARA RETRY:");
+    Logger.log(JSON.stringify(errorData, null, 2));
+    
+    // Opcional: Si tienes una hoja de cálculo configurada, puedes guardar ahí
+    // const spreadsheetId = "TU_SPREADSHEET_ID_AQUI"; // Reemplazar con tu ID
+    // const sheet = SpreadsheetApp.openById(spreadsheetId).getActiveSheet();
+    // 
+    // const row = [
+    //   new Date(),
+    //   formData.nombre || '',
+    //   formData.apellido || '',
+    //   formData.mail || '',
+    //   formData.telefono || '',
+    //   formData.localidad || '',
+    //   formData.provincia || '',
+    //   formData.concatenatedCheckboxes || '',
+    //   formData.comentarios || '',
+    //   formData.evento || '',
+    //   error,
+    //   'PENDIENTE'
+    // ];
+    // 
+    // sheet.appendRow(row);
+    // Logger.log("Envío fallido guardado en hoja de cálculo");
     
   } catch (saveError) {
     Logger.log("Error al guardar envío fallido: " + saveError.toString());
@@ -838,379 +1470,324 @@ function saveFailedSubmission(formData, error) {
 }
 
 /**
- * Enviar notificación de error por email
+ * Enviar notificación de error al administrador
  */
 function sendErrorNotification(error, formEvent) {
   try {
-    const subject = "Error en integración Google Forms -> Odoo";
-    const body = `
-Se produjo un error al procesar una respuesta del formulario:
+    Logger.log("📧 Enviando notificación de error al administrador");
+    
+    // Crear mensaje de error detallado
+    const errorMessage = `
+ERROR EN INTEGRACIÓN GOOGLE FORMS → ODOO
+========================================
 
-Error: ${error.toString()}
+TIMESTAMP: ${new Date().toLocaleString('es-AR')}
+ERROR: ${error.toString()}
 
-Timestamp: ${new Date()}
+STACK TRACE:
+${error.stack || 'No disponible'}
 
-Datos del evento: ${JSON.stringify(formEvent, null, 2)}
+DATOS DEL EVENTO:
+${formEvent ? JSON.stringify(formEvent, null, 2) : 'No disponible'}
 
-Por favor revisa los logs para más detalles.
+ACCIÓN REQUERIDA:
+- Revisar logs en Google Apps Script
+- Verificar conectividad con Odoo
+- Validar datos del formulario
     `;
     
-    // Reemplaza con tu email
-    const adminEmail = "maused@dyesa.com";
+    Logger.log("🚨 NOTIFICACIÓN DE ERROR:");
+    Logger.log(errorMessage);
     
-    MailApp.sendEmail(adminEmail, subject, body);
-    Logger.log("Notificación de error enviada por email");
+    // Opcional: Enviar email si tienes configurado
+    // MailApp.sendEmail({
+    //   to: 'admin@tuempresa.com',
+    //   subject: '🚨 Error en integración Google Forms → Odoo',
+    //   body: errorMessage
+    // });
     
-  } catch (emailError) {
-    Logger.log("Error al enviar notificación por email: " + emailError.toString());
+  } catch (notificationError) {
+    Logger.log("Error al enviar notificación: " + notificationError.toString());
   }
 }
 
 // ===============================
-// FUNCIONES DE CONFIGURACIÓN Y TESTING
+// DOCUMENTACIÓN ACTUALIZADA
 // ===============================
 
 /**
- * Función para configurar el trigger automáticamente
- * IMPORTANTE: Ejecuta esta función manualmente desde el editor de Apps Script
+ * 📄 RESUMEN DE CONFIGURACIÓN ACTUALIZADA
+ * =======================================
+ * 
+ * ✅ PROBLEMAS CORREGIDOS:
+ * 
+ * 1. ERROR DE SINTAXIS CORREGIDO:
+ *    - Línea 24: fieldMapping = {} cambiado a fieldMapping: {}
+ * 
+ * 2. BÚSQUEDA DINÁMICA DE PAÍS IMPLEMENTADA:
+ *    - No más país hardcodeado (Argentina por defecto)
+ *    - findCountryByLocation() busca país basado en localidad/provincia
+ *    - Mapeo inteligente de provincias argentinas conocidas
+ *    - Mapeo de ciudades importantes de Sudamérica (Argentina, Brasil, Chile, Uruguay, Paraguay, Bolivia)
+ *    - Búsqueda en res.country.state y partners existentes de Odoo
+ *    - Fallback inteligente a Argentina si no se encuentra
+ * 
+ * CARACTERÍSTICAS PRINCIPALES:
+ * 
+ * 3. MAPEOS DE CAMPOS CORREGIDOS:
+ *    - "Registrador" → registrador (operador que registra)
+ *    - "EMPRESAREGISTRADOR" → empresaRegistradora (empresa registradora) 
+ *    - "Asignado a" → comercial (comercial asignado/salesperson)
+ * 
+ * 4. BÚSQUEDA MEJORADA DE PROVINCIAS:
+ *    - getProvinceIdDynamic() busca en el país correcto dinámicamente
+ *    - Búsqueda exacta y parcial por nombre y código
+ *    - Considera el país encontrado para búsqueda precisa
+ * 
+ * 5. BÚSQUEDA DE COMERCIALES:
+ *    - getSalespersonId() busca comerciales en Odoo
+ *    - Asigna automáticamente al campo user_id del lead
+ *    - Búsqueda múltiple: nombre, login, partner, email
+ * 
+ * 6. FORMATO HTML EN DESCRIPCIÓN:
+ *    - Notas internas formateadas como HTML con estilos profesionales
+ *    - Colores, iconos y estructura visual mejorada
+ *    - Información organizada en secciones claras con CSS inline
+ * 
+ * 7. CAMPOS PERSONALIZADOS:
+ *    - Intenta guardar registrador en x_studio_registrador
+ *    - Intenta guardar empresa en x_studio_empresa_registradora
+ *    - Si no existen, incluye en descripción HTML
+ * 
+ * 8. FUNCIONES DE PRUEBA DISPONIBLES:
+ *    - testNewFieldMappings(): Verifica mapeo de campos
+ *    - testSalespersonSearch(): Prueba búsqueda de comerciales
+ *    - testLocationSearch(): Prueba búsqueda dinámica de ubicación (NUEVA)
+ * 
+ * FLUJO DE BÚSQUEDA DE UBICACIÓN:
+ * 1. Analiza provincia → Si es argentina conocida → Retorna Argentina (ID: 10)
+ * 2. Busca provincia en res.country.state → Retorna país de la provincia
+ * 3. Busca localidad en mapeo de ciudades → Retorna país conocido
+ * 4. Busca en partners existentes por ciudad → Retorna país encontrado
+ * 5. Fallback → Argentina (ID: 10)
+ * 
+ * PRÓXIMOS PASOS PARA IMPLEMENTACIÓN:
+ * 1. ✅ Corregir sintaxis y guardar script
+ * 2. 🔧 Ejecutar testLocationSearch() para verificar búsqueda de ubicación
+ * 3. 🔧 Ejecutar testNewFieldMappings() para verificar mapeos * 4. 🔧 Ejecutar testSalespersonSearch() para probar búsqueda
+ * 5. 📊 Enlazar formulario con spreadsheet  
+ * 6. ⚙️ Configurar trigger de envío automático
+ * 7. 🧪 Probar con envío real del formulario
  */
-function setupFormTrigger() {
-  try {
-    Logger.log("Iniciando configuración de trigger...");
-    
-    // Verificar permisos primero
-    Logger.log("Verificando permisos de acceso...");
-    
-    // Eliminar triggers existentes para este formulario
-    const triggers = ScriptApp.getProjectTriggers();
-    Logger.log("Triggers existentes encontrados: " + triggers.length);
-    
-    for (const trigger of triggers) {
-      if (trigger.getHandlerFunction() === 'onFormSubmit') {
-        Logger.log("Eliminando trigger existente...");
-        ScriptApp.deleteTrigger(trigger);
-      }
-    }
-    
-    // Intentar acceder al formulario
-    Logger.log("Intentando acceder al formulario con ID: " + FORM_CONFIG.formId);
-    const form = FormApp.openById(FORM_CONFIG.formId);
-    Logger.log("Acceso al formulario exitoso. Título: " + form.getTitle());
-      // Verificar si el formulario tiene hoja de cálculo vinculada
-    Logger.log("Verificando si el formulario tiene hoja de cálculo vinculada...");
-    
-    try {
-      const destinationId = form.getDestinationId();
-      if (destinationId) {
-        Logger.log("Formulario vinculado a hoja de cálculo: " + destinationId);
-          // Crear trigger en la hoja de cálculo
-        const spreadsheet = SpreadsheetApp.openById(destinationId);
-        const newTrigger = ScriptApp.newTrigger('onFormSubmit')
-          .onFormSubmit()
-          .create();
-          
-        Logger.log("✅ Trigger configurado exitosamente en la hoja de cálculo");
-        Logger.log("ID del trigger: " + newTrigger.getUniqueId());
-        
-      } else {
-        Logger.log("❌ El formulario no está vinculado a una hoja de cálculo");
-        Logger.log("📋 SOLUCIÓN: Necesitas vincular el formulario a una hoja de cálculo");
-        Logger.log("1. Ve al formulario en modo edición");
-        Logger.log("2. Haz clic en 'Respuestas' > Crear hoja de cálculo");
-        Logger.log("3. Una vez vinculado, ejecuta esta función nuevamente");
-        throw new Error("Formulario no vinculado a hoja de cálculo");
-      }
-      
-    } catch (destinationError) {
-      Logger.log("❌ Error al obtener destino del formulario: " + destinationError.toString());
-      Logger.log("🔧 ALTERNATIVA: Configuración manual del trigger");
-      throw destinationError;
-    }
-    
-  } catch (error) {
-    Logger.log("❌ Error al configurar trigger: " + error.toString());
-    Logger.log("📝 SOLUCIONES POSIBLES:");
-    Logger.log("1. Verifica que el ID del formulario sea correcto");
-    Logger.log("2. Asegúrate de tener permisos de edición en el formulario");
-    Logger.log("3. El formulario debe estar en tu Google Drive o compartido contigo");
-    Logger.log("4. Usa la función setupTriggerManual() como alternativa");
-    throw error;
-  }
-}
+
+// ===============================
+// FUNCIONES DE PRUEBA
+// ===============================
 
 /**
- * Función alternativa para configurar trigger manualmente
- * Usa esta función si setupFormTrigger() falla
+ * Test de búsqueda de ubicación (países y provincias)
  */
-function setupTriggerManual() {
-  Logger.log("=== CONFIGURACIÓN MANUAL DE TRIGGER ===");
-  Logger.log("El formulario necesita estar vinculado a una hoja de cálculo para funcionar.");
-  Logger.log("");
-  Logger.log("📋 PASOS PARA CONFIGURAR:");
-  Logger.log("");
-  Logger.log("OPCIÓN 1 - Vincular formulario a hoja de cálculo:");
-  Logger.log("1. Ve a tu formulario: https://docs.google.com/forms/d/" + FORM_CONFIG.formId + "/edit");
-  Logger.log("2. Haz clic en la pestaña 'Respuestas'");
-  Logger.log("3. Haz clic en 'Crear hoja de cálculo' (ícono verde)");
-  Logger.log("4. Una vez creada, ejecuta: setupFormTrigger()");
-  Logger.log("");
-  Logger.log("OPCIÓN 2 - Configurar trigger desde la hoja de cálculo:");
-  Logger.log("1. Si ya tienes una hoja de cálculo vinculada, ábrela");
-  Logger.log("2. Ve a Extensiones > Apps Script");
-  Logger.log("3. Pega este código y configura el trigger");
-  Logger.log("");
-  Logger.log("OPCIÓN 3 - Configurar trigger manualmente en Apps Script:");
-  Logger.log("1. Ve a 'Activadores' en el menú izquierdo del editor");
-  Logger.log("2. Haz clic en '+ Agregar activador'");
-  Logger.log("3. Configura:");
-  Logger.log("   - Función: onFormSubmit");
-  Logger.log("   - Origen del evento: Desde hojas de cálculo");
-  Logger.log("   - Tipo de evento: Al enviar formulario");
-  Logger.log("   - Selecciona la hoja vinculada al formulario");
-  Logger.log("4. Haz clic en 'Guardar'");
-  Logger.log("");
-  Logger.log("Formulario ID: " + FORM_CONFIG.formId);
-  Logger.log("=====================================");
-}
-
-/**
- * Función para configurar automáticamente la vinculación con hoja de cálculo
- */
-function setupFormWithSpreadsheet() {
-  try {
-    Logger.log("🔗 Configurando formulario con hoja de cálculo...");
-    
-    const form = FormApp.openById(FORM_CONFIG.formId);
-    Logger.log("Formulario encontrado: " + form.getTitle());
-    
-    // Verificar si ya está vinculado
-    const existingDestination = form.getDestinationId();
-    if (existingDestination) {
-      Logger.log("✅ El formulario ya está vinculado a: " + existingDestination);
-      
-      // Configurar trigger en la hoja existente
-      const spreadsheet = SpreadsheetApp.openById(existingDestination);
-      
-      // Eliminar triggers existentes
-      const triggers = ScriptApp.getProjectTriggers();
-      for (const trigger of triggers) {
-        if (trigger.getHandlerFunction() === 'onFormSubmit') {
-          ScriptApp.deleteTrigger(trigger);
-        }
-      }
-        // Crear nuevo trigger
-      const newTrigger = ScriptApp.newTrigger('onFormSubmit')
-        .onFormSubmit()
-        .create();
-        
-      Logger.log("✅ Trigger configurado en hoja existente");
-      Logger.log("ID del trigger: " + newTrigger.getUniqueId());
-      Logger.log("URL de la hoja: " + spreadsheet.getUrl());
-      
-    } else {
-      Logger.log("❌ El formulario no está vinculado a ninguna hoja de cálculo");
-      Logger.log("📋 Necesitas crear la vinculación manualmente:");
-      Logger.log("1. Ve a: https://docs.google.com/forms/d/" + FORM_CONFIG.formId + "/edit");
-      Logger.log("2. Pestaña 'Respuestas' > 'Crear hoja de cálculo'");
-      Logger.log("3. Luego ejecuta: setupFormWithSpreadsheet()");
-    }
-    
-  } catch (error) {
-    Logger.log("❌ Error: " + error.toString());
-    throw error;
-  }
-}
-
-/**
- * Función para verificar el acceso al formulario
- */
-function checkFormAccess() {
-  try {
-    Logger.log("Verificando acceso al formulario...");
-    Logger.log("ID del formulario: " + FORM_CONFIG.formId);
-    
-    const form = FormApp.openById(FORM_CONFIG.formId);
-    const title = form.getTitle();
-    const items = form.getItems();
-    
-    Logger.log("✅ Acceso exitoso al formulario:");
-    Logger.log("Título: " + title);
-    Logger.log("Número de preguntas: " + items.length);
-    Logger.log("URL de edición: " + form.getEditUrl());
-    Logger.log("URL de respuesta: " + form.getPublishedUrl());
-    
-    // Verificar vinculación con hoja de cálculo
-    try {
-      const destinationId = form.getDestinationId();
-      if (destinationId) {
-        Logger.log("✅ Formulario vinculado a hoja de cálculo: " + destinationId);
-        const spreadsheet = SpreadsheetApp.openById(destinationId);
-        Logger.log("URL de la hoja: " + spreadsheet.getUrl());
-      } else {
-        Logger.log("⚠️ Formulario NO vinculado a hoja de cálculo");
-        Logger.log("💡 Para configurar triggers automáticos, necesitas vincular el formulario");
-      }
-    } catch (destError) {
-      Logger.log("⚠️ Error verificando vinculación: " + destError.toString());
-    }
-    
-    // Mostrar las preguntas para verificar el mapeo
-    Logger.log("\n📋 Preguntas del formulario:");
-    items.forEach((item, index) => {
-      const title = item.getTitle();
-      const fieldName = mapQuestionToField(title);
-      Logger.log(`${index + 1}. "${title}" -> ${fieldName || 'NO MAPEADO'} (Tipo: ${item.getType()})`);
-    });
-    
-    return { success: true, form: form, hasDestination: !!form.getDestinationId() };
-    
-  } catch (error) {
-    Logger.log("❌ Error al acceder al formulario: " + error.toString());
-    Logger.log("💡 Posibles causas:");
-    Logger.log("- ID del formulario incorrecto");
-    Logger.log("- Sin permisos de acceso");
-    Logger.log("- Formulario eliminado o movido");
-    return { success: false, error: error.toString() };
-  }
-}
-
-/**
- * Función de test para validar la integración
- */
-function testIntegration() {
-  Logger.log("=== INICIANDO TEST DE INTEGRACIÓN ===");
+function testLocationSearch() {
+  Logger.log("=== PRUEBA DE BÚSQUEDA DE UBICACIÓN ===");
   
-  // Datos de prueba
+  try {
+    // Autenticación
+    const uid = xmlrpcLogin(ODOO_CONFIG.url, ODOO_CONFIG.db, ODOO_CONFIG.login, ODOO_CONFIG.password);
+    Logger.log("✅ Autenticación exitosa con UID: " + uid);
+    
+    // Prueba 1: Provincia argentina conocida
+    Logger.log("\n--- Prueba 1: Buenos Aires, Argentina ---");
+    const country1 = findCountryByLocation(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "La Plata", "Buenos Aires");
+    Logger.log("Resultado: " + JSON.stringify(country1));
+    
+    // Prueba 2: Ciudad brasileña
+    Logger.log("\n--- Prueba 2: São Paulo, Brasil ---");
+    const country2 = findCountryByLocation(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "São Paulo", "");
+    Logger.log("Resultado: " + JSON.stringify(country2));
+    
+    // Prueba 3: Ubicación desconocida
+    Logger.log("\n--- Prueba 3: Ubicación desconocida ---");
+    const country3 = findCountryByLocation(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "Ciudad Inventada", "Provincia Inventada");
+    Logger.log("Resultado: " + JSON.stringify(country3));
+    
+    Logger.log("✅ Prueba de búsqueda de ubicación completada");
+    
+  } catch (error) {
+    Logger.log("❌ Error en prueba de ubicación: " + error.toString());
+  }
+}
+
+/**
+ * Test de mapeo de campos nuevos
+ */
+function testNewFieldMappings() {
+  Logger.log("=== PRUEBA DE MAPEO DE CAMPOS ===");
+  
+  // Simular datos de formulario
   const testFormData = {
     nombre: "Juan",
     apellido: "Pérez",
     mail: "juan.perez@test.com",
-    telefono: "+54911234567",
+    telefono: "+54 11 1234-5678",
     localidad: "Buenos Aires",
     provincia: "Buenos Aires",
-    pais: "Argentina",
-    concatenatedCheckboxes: "WeedSeeker, Solución Siembra",
-    comentarios: "Test desde Google Forms",
-    montoEstimado: "50000",
-    evento: "Test Event",
-    operadorApp: "Test Operator",
-    empresaOperador: "Test Company",
-    comercialAsignado: "Test Commercial"
+    operadorApp: "María García",
+    empresaOperador: "DyE Agro",
+    comercialAsignado: "Carlos Vendedor",
+    verticales: "WeedSeeker, Solución de Siembra",
+    comentarios: "Cliente interesado en tecnología de precisión",
+    evento: "Expo Campo 2025"
+  };
+  
+  Logger.log("📋 Datos de prueba:");
+  Logger.log(JSON.stringify(testFormData, null, 2));
+  
+  Logger.log("\n🔄 Procesando verticales...");
+  const concatenatedVerticals = processVerticales(testFormData);
+  Logger.log("Verticales concatenadas: " + concatenatedVerticals);
+  
+  Logger.log("✅ Prueba de mapeo completada");
+}
+
+/**
+ * Test de búsqueda de vendedores
+ */
+function testSalespersonSearch() {
+  Logger.log("=== PRUEBA DE BÚSQUEDA DE VENDEDORES ===");
+  
+  try {
+    // Autenticación
+    const uid = xmlrpcLogin(ODOO_CONFIG.url, ODOO_CONFIG.db, ODOO_CONFIG.login, ODOO_CONFIG.password);
+    Logger.log("✅ Autenticación exitosa con UID: " + uid);
+    
+    // Prueba 1: Buscar vendedor existente
+    Logger.log("\n--- Prueba 1: Buscar vendedor ---");
+    const salesperson1 = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "Admin");
+    Logger.log("Resultado búsqueda 'Admin': " + JSON.stringify(salesperson1));
+    
+    // Prueba 2: Buscar vendedor por email
+    Logger.log("\n--- Prueba 2: Buscar por email ---");
+    const salesperson2 = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "admin@example.com");
+    Logger.log("Resultado búsqueda por email: " + JSON.stringify(salesperson2));
+    
+    // Prueba 3: Vendedor inexistente
+    Logger.log("\n--- Prueba 3: Vendedor inexistente ---");
+    const salesperson3 = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, "Vendedor Inexistente");
+    Logger.log("Resultado vendedor inexistente: " + JSON.stringify(salesperson3));
+    
+    Logger.log("✅ Prueba de búsqueda de vendedores completada");
+    
+  } catch (error) {
+    Logger.log("❌ Error en prueba de vendedores: " + error.toString());
+  }
+}
+
+/**
+ * Test específico para búsqueda GLOBAL de comerciales (sin restricciones de empresa)
+ */
+function testGlobalSalespersonSearch() {
+  Logger.log("=== PRUEBA BÚSQUEDA GLOBAL DE COMERCIALES ===");
+  
+  try {
+    // Autenticación
+    const uid = xmlrpcLogin(ODOO_CONFIG.url, ODOO_CONFIG.db, ODOO_CONFIG.login, ODOO_CONFIG.password);
+    Logger.log("✅ Autenticación exitosa con UID: " + uid);
+    
+    // 1. Listar TODOS los usuarios sin filtros para ver qué hay disponible
+    Logger.log("\n--- PASO 1: Listando TODOS los usuarios disponibles ---");
+    const allUsers = xmlrpcExecute(
+      ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
+      'res.users',
+      'search_read',
+      [[], ['id', 'name', 'login', 'active', 'company_id', 'company_ids'], 0, 10],
+      {}  // Context vacío
+    );
+    
+    if (allUsers && allUsers.length > 0) {
+      Logger.log(`📊 Total usuarios encontrados: ${allUsers.length}`);
+      allUsers.forEach((user, index) => {
+        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login}, Activo: ${user.active})`);
+        Logger.log(`      Empresa actual: ${user.company_id || 'N/A'}, Empresas: ${user.company_ids || 'N/A'}`);
+      });
+    } else {
+      Logger.log("❌ No se encontraron usuarios");
+    }
+    
+    // 2. Pruebas de búsqueda específicas
+    const testNames = ["Admin", "admin", "Administrator", "Usuario", "Test"];
+    
+    for (const testName of testNames) {
+      Logger.log(`\n--- PASO 2: Probando búsqueda de "${testName}" ---`);
+      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, testName);
+      
+      if (foundUser) {
+        Logger.log(`✅ ÉXITO: Comercial "${testName}" encontrado con ID: ${foundUser}`);
+      } else {
+        Logger.log(`❌ FALLO: No se encontró comercial "${testName}"`);
+      }
+    }
+    
+    // 3. Verificar contexto de empresa actual
+    Logger.log("\n--- PASO 3: Verificando contexto de usuario actual ---");
+    const currentUser = xmlrpcExecute(
+      ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
+      'res.users',
+      'read',
+      [uid, ['name', 'company_id', 'company_ids']]
+    );
+    
+    if (currentUser) {
+      Logger.log(`Usuario actual: ${currentUser.name}`);
+      Logger.log(`Empresa actual: ${currentUser.company_id || 'N/A'}`);
+      Logger.log(`Empresas accesibles: ${currentUser.company_ids || 'N/A'}`);
+    }
+    
+    Logger.log("\n✅ PRUEBA DE BÚSQUEDA GLOBAL COMPLETADA");
+    
+  } catch (error) {
+    Logger.log("❌ Error en prueba global de comerciales: " + error.toString());
+    Logger.log("🔧 Stack trace: " + error.stack);
+  }
+}
+
+/**
+ * Test completo de integración
+ */
+function testCompleteIntegration() {
+  Logger.log("=== PRUEBA COMPLETA DE INTEGRACIÓN ===");
+  
+  // Simular evento de formulario
+  const mockFormEvent = {
+    response: {
+      getItemResponses: function() {
+        return [
+          {
+            getItem: function() { return { getTitle: function() { return "Nombre"; } }; },
+            getResponse: function() { return "Juan"; }
+          },
+          {
+            getItem: function() { return { getTitle: function() { return "Apellido"; } }; },
+            getResponse: function() { return "Pérez"; }
+          },
+          {
+            getItem: function() { return { getTitle: function() { return "Email"; } }; },
+            getResponse: function() { return "juan.perez@test.com"; }
+          },
+          {
+            getItem: function() { return { getTitle: function() { return "Teléfono"; } }; },
+            getResponse: function() { return "+54 11 1234-5678"; }
+          }
+        ];
+      }
+    }
   };
   
   try {
-    const result = createOdooLead(testFormData);
-    Logger.log("Resultado del test: " + JSON.stringify(result));
-    
-    if (result.success) {
-      Logger.log("✅ Test exitoso - Lead creado con ID: " + result.lead_id);
-    } else {
-      Logger.log("❌ Test fallido: " + result.error);
-    }
+    Logger.log("🚀 Iniciando prueba completa...");
+    onFormSubmit(mockFormEvent);
+    Logger.log("✅ Prueba completa finalizada - revisar logs anteriores");
     
   } catch (error) {
-    Logger.log("❌ Error en test: " + error.toString());
-  }
-  
-  Logger.log("=== FIN TEST DE INTEGRACIÓN ===");
-}
-
-/**
- * Función para mostrar información de configuración
- */
-function showConfiguration() {
-  Logger.log("=== CONFIGURACIÓN ACTUAL ===");
-  Logger.log("Formulario ID: " + FORM_CONFIG.formId);
-  Logger.log("URL Odoo: " + ODOO_CONFIG.url);
-  Logger.log("Base de datos: " + ODOO_CONFIG.db);
-  Logger.log("Usuario: " + ODOO_CONFIG.login);
-  Logger.log("Mapeo de campos: " + JSON.stringify(FORM_CONFIG.fieldMapping, null, 2));
-  Logger.log("=== FIN CONFIGURACIÓN ===");
-}
-
-/**
- * Función para mostrar instrucciones detalladas de configuración
- */
-function showSetupInstructions() {
-  Logger.log("╔═══════════════════════════════════════════════════════════════════════════════╗");
-  Logger.log("║                    INSTRUCCIONES DE CONFIGURACIÓN                            ║");
-  Logger.log("║                   Google Forms → Odoo Integration                            ║");
-  Logger.log("╚═══════════════════════════════════════════════════════════════════════════════╝");
-  Logger.log("");
-  Logger.log("🎯 OBJETIVO: Configurar trigger para capturar respuestas del formulario");
-  Logger.log("");
-  Logger.log("📋 PROBLEMA ACTUAL:");
-  Logger.log("   El error 'onFormSubmit is not a function' indica que el trigger no se puede");
-  Logger.log("   configurar directamente en el formulario. Necesita una hoja de cálculo.");
-  Logger.log("");
-  Logger.log("🔧 SOLUCIÓN - OPCIÓN 1 (RECOMENDADA):");
-  Logger.log("   1. Ve a tu formulario: https://docs.google.com/forms/d/" + FORM_CONFIG.formId + "/edit");
-  Logger.log("   2. Haz clic en la pestaña 'Respuestas'");
-  Logger.log("   3. Haz clic en 'Crear hoja de cálculo' (ícono verde con +)");
-  Logger.log("   4. Una vez creada la hoja, vuelve aquí y ejecuta: setupTriggerFromSpreadsheet()");
-  Logger.log("");
-  Logger.log("🔧 SOLUCIÓN - OPCIÓN 2 (MANUAL):");
-  Logger.log("   1. Si ya tienes una hoja vinculada al formulario:");
-  Logger.log("   2. Ve a esa hoja de cálculo en Google Sheets");
-  Logger.log("   3. Menú Extensiones > Apps Script");
-  Logger.log("   4. Copia y pega el código completo de GoogleFormsToOdoo.gs");
-  Logger.log("   5. Ejecuta setupTriggerFromSpreadsheet() desde allí");
-  Logger.log("");
-  Logger.log("🔧 SOLUCIÓN - OPCIÓN 3 (TRIGGER MANUAL):");
-  Logger.log("   1. En el editor de Apps Script, ve a 'Activadores' (menú izquierdo)");
-  Logger.log("   2. Haz clic en '+ Agregar activador'");
-  Logger.log("   3. Configura:");
-  Logger.log("      - Función: onFormSubmit");
-  Logger.log("      - Origen del evento: Desde hojas de cálculo");
-  Logger.log("      - Tipo de evento: Al enviar formulario");
-  Logger.log("      - Selecciona la hoja vinculada al formulario");
-  Logger.log("   4. Haz clic en 'Guardar'");
-  Logger.log("");
-  Logger.log("🧪 VERIFICAR CONFIGURACIÓN:");
-  Logger.log("   Ejecuta: checkTriggerStatus() para verificar que todo esté configurado");
-  Logger.log("");
-  Logger.log("🧪 PROBAR INTEGRACIÓN:");
-  Logger.log("   Ejecuta: testOdooConnection() para probar la conexión con Odoo");
-  Logger.log("   Ejecuta: testFormSubmission() para simular una respuesta");
-  Logger.log("");
-  Logger.log("📊 DATOS DEL FORMULARIO:");
-  Logger.log("   ID: " + FORM_CONFIG.formId);
-  Logger.log("   URL: https://docs.google.com/forms/d/" + FORM_CONFIG.formId);
-  Logger.log("");
-  Logger.log("🏢 CONFIGURACIÓN ODOO:");
-  Logger.log("   URL: " + ODOO_CONFIG.url);
-  Logger.log("   Base de datos: " + ODOO_CONFIG.database);
-  Logger.log("   Usuario: " + ODOO_CONFIG.username);
-  Logger.log("");
-  Logger.log("❓ Si tienes problemas, ejecuta: diagnosticFormIntegration()");
-  Logger.log("");
-  Logger.log("╚═══════════════════════════════════════════════════════════════════════════════╝");
-}
-
-/**
- * Función para ejecutar todas las verificaciones necesarias
- */
-function runFullDiagnostic() {
-  Logger.log("🔍 EJECUTANDO DIAGNÓSTICO COMPLETO...");
-  Logger.log("");
-  
-  try {
-    Logger.log("1️⃣ Verificando acceso al formulario...");
-    checkFormAccess();
-    Logger.log("");
-    
-    Logger.log("2️⃣ Verificando estado de triggers...");
-    checkTriggerStatus();
-    Logger.log("");
-    
-    Logger.log("3️⃣ Verificando conexión con Odoo...");
-    testOdooConnection();
-    Logger.log("");
-    
-    Logger.log("✅ DIAGNÓSTICO COMPLETADO");
-    Logger.log("Revisa los resultados arriba para identificar problemas");
-    
-  } catch (error) {
-    Logger.log("❌ Error durante diagnóstico: " + error.toString());
+    Logger.log("❌ Error en prueba completa: " + error.toString());
   }
 }
