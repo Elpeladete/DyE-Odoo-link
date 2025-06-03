@@ -1091,43 +1091,189 @@ function getProvinceId(url, db, uid, password, provinceName, countryId = 10) {
 
 /**
  * Buscar comercial/salesperson en Odoo por nombre
- * Búsqueda GLOBAL sin restricciones de empresa o equipo de ventas
+ * Búsqueda mejorada considerando equipos de ventas (crm.team) y variantes de nombres
  */
 function getSalespersonId(url, db, uid, password, salespersonName) {
   if (!salespersonName || salespersonName.trim() === '') return null;
   
   try {
-    Logger.log(`🔍 Buscando comercial GLOBALMENTE (sin restricciones): "${salespersonName}"`);
+    Logger.log(`🔍 Buscando comercial: "${salespersonName}" (considerando equipos de ventas)`);
     
-    // 1. BÚSQUEDA PRINCIPAL: Usuarios SIN restricciones de empresa
-    const userSearchCriteria = [
-      '|', '|', '|', '|',
+    // Preparar variantes del nombre para mejorar la búsqueda
+    const nameVariants = prepareNameVariants(salespersonName);
+    Logger.log(`📋 Variantes del nombre preparadas: ${JSON.stringify(nameVariants)}`);
+    
+    // Context vacío para evitar restricciones
+    const contextFree = {};
+    
+    // PASO 1: BUSCAR PRIMERO EN EQUIPOS DE VENTAS
+    Logger.log("🔎 Paso 1: Buscando primero en equipos de ventas (crm.team)...");
+    
+    // Buscar equipos de venta que coincidan con el nombre buscado (con variantes)
+    let teamSearchCriteria;
+    if (nameVariants.length > 1) {
+      // Si hay variantes, construir un OR dinámico
+      teamSearchCriteria = nameVariants.map(variant => ['name', 'ilike', variant]);
+      // Agregar los operadores '|' necesarios (n-1 operadores para n condiciones)
+      for (let i = 0; i < nameVariants.length - 1; i++) {
+        teamSearchCriteria.unshift('|');
+      }
+    } else {
+      teamSearchCriteria = [['name', 'ilike', salespersonName]];
+    }
+    
+    const salesTeams = xmlrpcExecute(
+      url, db, uid, password,
+      'crm.team',
+      'search_read',
+      [teamSearchCriteria, ['id', 'name', 'user_id', 'member_ids', 'company_id'], 0, 5],
+      contextFree
+    );
+    
+    // Si encontramos equipos, buscar usuarios en ellos
+    if (salesTeams && salesTeams.length > 0) {
+      Logger.log(`📊 Encontrados ${salesTeams.length} equipos de venta que coinciden con "${salespersonName}"`);
+      
+      for (const team of salesTeams) {
+        Logger.log(`   🏢 Equipo: "${team.name}" (ID: ${team.id})`);
+        
+        // Primero verificar el líder del equipo (user_id)
+        if (team.user_id && team.user_id[0]) {
+          Logger.log(`   ✅ Líder del equipo encontrado: ${team.user_id[1]} (ID: ${team.user_id[0]})`);
+          return team.user_id[0]; // Devolver líder del equipo
+        }
+        
+        // Si no hay líder definido, buscar en los miembros
+        if (team.member_ids && team.member_ids.length > 0) {
+          Logger.log(`   👥 Equipo tiene ${team.member_ids.length} miembros, obteniendo detalles...`);
+          
+          // Obtener detalles de los miembros
+          const teamMembers = xmlrpcExecute(
+            url, db, uid, password,
+            'res.users',
+            'search_read',
+            [[['id', 'in', team.member_ids]], ['id', 'name', 'active']],
+            contextFree
+          );
+          
+          if (teamMembers && teamMembers.length > 0) {
+            // Priorizar miembros activos
+            const activeMembers = teamMembers.filter(user => user.active !== false);
+            
+            if (activeMembers.length > 0) {
+              const member = activeMembers[0];
+              Logger.log(`   ✅ Miembro activo del equipo seleccionado: ${member.name} (ID: ${member.id})`);
+              return member.id;
+            } else if (teamMembers.length > 0) {
+              const member = teamMembers[0];
+              Logger.log(`   ⚠️ Miembro inactivo del equipo seleccionado: ${member.name} (ID: ${member.id})`);
+              return member.id;
+            }
+          }
+        }
+      }
+    }
+    
+    // PASO 2: BUSCAR EQUIPOS DONDE EL NOMBRE COINCIDA CON UN MIEMBRO
+    Logger.log("🔎 Paso 2: Buscando equipos con miembros que coincidan con el nombre...");
+    
+    // Primero encontrar usuarios que coincidan con el nombre
+    const userSearchByName = [
+      '|', '|',
       ['name', 'ilike', salespersonName],
-      ['login', 'ilike', salespersonName], 
-      ['partner_id.name', 'ilike', salespersonName],
-      ['partner_id.email', 'ilike', salespersonName],
+      ['login', 'ilike', salespersonName],
       ['email', 'ilike', salespersonName]
     ];
     
-    Logger.log("🔎 Buscando en res.users (TODOS los usuarios, todas las empresas)...");
+    const potentialUsers = xmlrpcExecute(
+      url, db, uid, password,
+      'res.users',
+      'search_read',
+      [userSearchByName, ['id', 'name', 'active']],
+      contextFree
+    );
     
-    // IMPORTANTE: Usar context vacío para evitar filtros de empresa
-    const contextFree = {};
+    if (potentialUsers && potentialUsers.length > 0) {
+      Logger.log(`   👤 Encontrados ${potentialUsers.length} usuarios que coinciden con el nombre`);
+      
+      // Para cada usuario, verificar si es miembro de algún equipo de ventas
+      for (const user of potentialUsers) {
+        // Buscar equipos donde este usuario es miembro
+        const teamsWithUser = xmlrpcExecute(
+          url, db, uid, password,
+          'crm.team',
+          'search_read',
+          [
+            ['|', 
+              ['user_id', '=', user.id],  // Es líder
+              ['member_ids', 'in', [user.id]]  // Es miembro
+            ]
+          ],
+          ['id', 'name'],
+          contextFree
+        );
+        
+        if (teamsWithUser && teamsWithUser.length > 0) {
+          Logger.log(`   ✅ Usuario ${user.name} (ID: ${user.id}) es miembro de ${teamsWithUser.length} equipos de venta`);
+          return user.id;
+        }
+      }
+      
+      // Si llegamos aquí, encontramos usuarios pero ninguno está en equipos de venta
+      // Aún así, podemos devolver uno de ellos como respaldo
+      const activeUsers = potentialUsers.filter(user => user.active !== false);
+      
+      if (activeUsers.length > 0) {
+        const user = activeUsers[0];
+        Logger.log(`   ⚠️ Usuario activo encontrado (sin equipo): ${user.name} (ID: ${user.id})`);
+        return user.id;
+      } else if (potentialUsers.length > 0) {
+        const user = potentialUsers[0];
+        Logger.log(`   ⚠️ Usuario inactivo encontrado (sin equipo): ${user.name} (ID: ${user.id})`);
+        return user.id;
+      }
+    }
+    
+    // PASO 3: BÚSQUEDA ESTÁNDAR ORIGINAL (FALLBACK)
+    Logger.log("🔎 Paso 3: Búsqueda estándar en todos los usuarios...");
+      // 3.1. BÚSQUEDA PRINCIPAL: Usuarios SIN restricciones de empresa
+    // Construir criterios de búsqueda con todas las variantes del nombre
+    let userSearchCriteria = [];
+    
+    // Para cada variante, añadir criterios de búsqueda
+    nameVariants.forEach((variant, index) => {
+      if (index > 0) {
+        // Añadir '|' para cada variante adicional
+        userSearchCriteria.unshift('|');
+      }
+      
+      // Criterios para esta variante
+      userSearchCriteria.push(
+        '|', '|', '|', '|',
+        ['name', 'ilike', variant],
+        ['login', 'ilike', variant], 
+        ['partner_id.name', 'ilike', variant],
+        ['partner_id.email', 'ilike', variant],
+        ['email', 'ilike', variant]
+      );
+    });
+    
+    Logger.log(`   🔍 Buscando usuarios con criterios expandidos para variantes de nombre`);
     
     const existingUsers = xmlrpcExecute(
       url, db, uid, password,
       'res.users',
       'search_read',
-      [userSearchCriteria, ['id', 'name', 'login', 'email', 'active', 'company_id', 'company_ids'], 0, 20], // Más resultados
-      contextFree  // Context vacío = sin restricciones
+      [userSearchCriteria, ['id', 'name', 'login', 'email', 'active', 'company_id', 'company_ids'], 0, 20],
+      contextFree
     );
     
     if (existingUsers && existingUsers.length > 0) {
-      Logger.log(`📊 Encontrados ${existingUsers.length} usuarios candidatos`);
+      Logger.log(`   📊 Encontrados ${existingUsers.length} usuarios candidatos`);
       
       // Mostrar todos los candidatos para debug
       existingUsers.forEach((user, index) => {
-        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login}, Activo: ${user.active}, Empresas: ${user.company_ids || user.company_id})`);
+        Logger.log(`      ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login}, Activo: ${user.active})`);
       });
       
       // Priorizar usuarios activos
@@ -1135,18 +1281,18 @@ function getSalespersonId(url, db, uid, password, salespersonName) {
       
       if (activeUsers.length > 0) {
         const user = activeUsers[0];
-        Logger.log(`✅ Usuario ACTIVO seleccionado: ${user.name} (ID: ${user.id})`);
+        Logger.log(`   ✅ Usuario ACTIVO seleccionado: ${user.name} (ID: ${user.id})`);
         return user.id;
       } else {
         // Si no hay activos, tomar el primero disponible
         const user = existingUsers[0];
-        Logger.log(`⚠️ Usuario INACTIVO seleccionado: ${user.name} (ID: ${user.id}) - usando de todas formas`);
+        Logger.log(`   ⚠️ Usuario INACTIVO seleccionado: ${user.name} (ID: ${user.id}) - usando de todas formas`);
         return user.id;
       }
     }
     
-    // 2. BÚSQUEDA ALTERNATIVA: Partners SIN restricciones de empresa
-    Logger.log("🔎 Buscando en res.partner (TODOS los contactos individuales)...");
+    // 3.2. BÚSQUEDA ALTERNATIVA: Partners sin restricciones de empresa
+    Logger.log("🔎 Buscando en res.partner (contactos individuales)...");
     const partnerSearchCriteria = [
       ['name', 'ilike', salespersonName],
       ['is_company', '=', false]  // Solo contactos individuales
@@ -1157,66 +1303,74 @@ function getSalespersonId(url, db, uid, password, salespersonName) {
       'res.partner',
       'search_read',
       [partnerSearchCriteria, ['id', 'name', 'email', 'company_id'], 0, 20],
-      contextFree  // Sin restricciones de empresa
+      contextFree
     );
     
     if (existingPartners && existingPartners.length > 0) {
-      Logger.log(`📊 Encontrados ${existingPartners.length} partners candidatos`);
+      Logger.log(`   📊 Encontrados ${existingPartners.length} partners candidatos`);
       
       // Para cada partner, buscar si tiene usuario asociado
       for (const partner of existingPartners) {
-        Logger.log(`   Verificando partner: ${partner.name} (ID: ${partner.id})`);
+        Logger.log(`      Verificando partner: ${partner.name} (ID: ${partner.id})`);
         
         const partnerUser = xmlrpcExecute(
           url, db, uid, password,
           'res.users',
           'search_read',
           [[['partner_id', '=', partner.id]], ['id', 'name', 'active'], 0, 1],
-          contextFree  // Sin restricciones
+          contextFree
         );
         
         if (partnerUser && partnerUser.length > 0) {
           const user = partnerUser[0];
-          Logger.log(`✅ Usuario encontrado via partner: ${user.name} (ID: ${user.id}, Partner: ${partner.name})`);
+          Logger.log(`   ✅ Usuario encontrado via partner: ${user.name} (ID: ${user.id}, Partner: ${partner.name})`);
           return user.id;
         }
       }
       
-      Logger.log(`ℹ️ Partners encontrados pero ninguno con usuario asociado`);
+      Logger.log(`   ℹ️ Partners encontrados pero ninguno con usuario asociado`);
     }
-    
-    // 3. BÚSQUEDA POR COINCIDENCIA PARCIAL SÚPER FLEXIBLE
+      // 3.3. BÚSQUEDA POR COINCIDENCIA PARCIAL SÚPER FLEXIBLE
     Logger.log("🔎 Búsqueda súper flexible por coincidencia parcial...");
-    const flexibleSearch = [
-      '|', '|',
-      ['name', 'ilike', `%${salespersonName}%`],
-      ['login', 'ilike', `%${salespersonName}%`],
-      ['email', 'ilike', `%${salespersonName}%`]
-    ];
+    
+    // Construir búsqueda flexible con todas las variantes
+    let flexibleSearch = [];
+    
+    nameVariants.forEach((variant, index) => {
+      if (index > 0) {
+        // Añadir '|' para cada variante adicional
+        flexibleSearch.unshift('|');
+      }
+      
+      // Criterios flexibles para esta variante (usando % para coincidencia parcial)
+      flexibleSearch.push(
+        '|', '|',
+        ['name', 'ilike', `%${variant}%`],
+        ['login', 'ilike', `%${variant}%`],
+        ['email', 'ilike', `%${variant}%`]
+      );
+    });
     
     const flexibleUsers = xmlrpcExecute(
       url, db, uid, password,
       'res.users',
       'search_read',
       [flexibleSearch, ['id', 'name', 'login', 'active', 'company_id'], 0, 10],
-      contextFree  // Sin restricciones
+      contextFree
     );
     
     if (flexibleUsers && flexibleUsers.length > 0) {
-      Logger.log(`📊 Búsqueda flexible encontró ${flexibleUsers.length} candidatos:`);
-      flexibleUsers.forEach((user, index) => {
-        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login})`);
-      });
+      Logger.log(`   📊 Búsqueda flexible encontró ${flexibleUsers.length} candidatos`);
       
       const user = flexibleUsers[0];
-      Logger.log(`✅ Usuario seleccionado (coincidencia parcial): ${user.name} (ID: ${user.id})`);
+      Logger.log(`   ✅ Usuario seleccionado (coincidencia parcial): ${user.name} (ID: ${user.id})`);
       return user.id;
     }
     
-    // 4. BÚSQUEDA DE RESPALDO: CUALQUIER usuario que pueda ser comercial
+    // 3.4. BÚSQUEDA DE RESPALDO: CUALQUIER usuario que pueda ser comercial
     Logger.log("🔎 Búsqueda de respaldo: cualquier usuario disponible...");
     try {
-      // Buscar usuarios que NO sean internos del sistema (admin, etc.)
+      // Buscar usuarios activos que NO sean internos del sistema
       const fallbackUsers = xmlrpcExecute(
         url, db, uid, password,
         'res.users',
@@ -1231,21 +1385,20 @@ function getSalespersonId(url, db, uid, password, salespersonName) {
           0, 
           5
         ],
-        contextFree  // Sin restricciones
+        contextFree
       );
       
       if (fallbackUsers && fallbackUsers.length > 0) {
         const user = fallbackUsers[0];
-        Logger.log(`⚠️ FALLBACK: Usando usuario disponible: ${user.name} (ID: ${user.id})`);
+        Logger.log(`   ⚠️ FALLBACK: Usando usuario disponible: ${user.name} (ID: ${user.id})`);
         return user.id;
       }
     } catch (fallbackError) {
       Logger.log("⚠️ Error en búsqueda de respaldo: " + fallbackError.toString());
     }
-    
-    Logger.log(`❌ NO se encontró NINGÚN comercial con nombre: "${salespersonName}"`);
+      Logger.log(`❌ NO se encontró NINGÚN comercial con nombre: "${salespersonName}"`);
     Logger.log("💡 Posibles causas:");
-    Logger.log("   - El nombre no coincide con ningún usuario en Odoo");
+    Logger.log("   - El nombre no coincide con ningún equipo de ventas ni usuario en Odoo");
     Logger.log("   - Problemas de permisos en la base de datos");
     Logger.log("   - Usuario inexistente o mal escrito");
     return null;
@@ -1255,6 +1408,105 @@ function getSalespersonId(url, db, uid, password, salespersonName) {
     Logger.log("🔧 Stack trace: " + error.stack);
     return null;
   }
+}
+
+/**
+ * Prepara variantes de un nombre para mejorar la búsqueda con caracteres especiales
+ * Maneja casos como apóstrofes, acentos y caracteres especiales
+ * @param {string} name - Nombre original a procesar
+ * @return {Array<string>} - Array de variantes del nombre
+ */
+function prepareNameVariants(name) {
+  if (!name) return [''];
+  
+  const variants = [name]; // Siempre incluir el nombre original
+  
+  // Limpiar el nombre y agregar como variante (sin espacios extras ni puntuación)
+  const cleanName = name.trim()
+    .replace(/\s+/g, ' ')  // Normalizar espacios
+    .normalize("NFD") // Descomponer acentos
+    .replace(/[\u0300-\u036f]/g, ""); // Eliminar diacríticos
+    
+  if (cleanName !== name) {
+    variants.push(cleanName);
+  }
+  
+  // Variantes específicas para casos comunes
+  
+  // 1. Manejo de apóstrofes (D'Auria → DAuria, D Auria)
+  if (name.includes("'")) {
+    // Variante sin apóstrofe (D'Auria → DAuria)
+    const noApostropheName = name.replace(/'/g, '');
+    variants.push(noApostropheName);
+    
+    // Variante con apóstrofe cambiado por espacio (D'Auria → D Auria)
+    const spaceForApostropheName = name.replace(/'/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!variants.includes(spaceForApostropheName)) {
+      variants.push(spaceForApostropheName);
+    }
+  }
+  
+  // 2. Manejo de guiones y puntos
+  if (name.includes("-") || name.includes(".")) {
+    // Variante sin guiones ni puntos
+    const noSymbolsName = name.replace(/[-\.]/g, '');
+    if (!variants.includes(noSymbolsName)) {
+      variants.push(noSymbolsName);
+    }
+    
+    // Variante con guiones y puntos convertidos a espacios
+    const spacesForSymbolsName = name.replace(/[-\.]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!variants.includes(spacesForSymbolsName)) {
+      variants.push(spacesForSymbolsName);
+    }
+  }
+  
+  // 3. Nombres compuestos (apellido, nombre → nombre apellido)
+  if (name.includes(",")) {
+    const parts = name.split(",").map(part => part.trim());
+    if (parts.length === 2) {
+      // Invertir orden (apellido, nombre → nombre apellido)
+      const reversedName = `${parts[1]} ${parts[0]}`.trim();
+      if (!variants.includes(reversedName)) {
+        variants.push(reversedName);
+      }
+      
+      // También sin coma
+      const noCommaName = name.replace(",", " ").replace(/\s+/g, ' ').trim();
+      if (!variants.includes(noCommaName)) {
+        variants.push(noCommaName);
+      }
+    }
+  }
+  
+  // 4. Iniciales en nombres (J. Pérez → J Pérez, JPérez)
+  if (/\b[A-Z]\.\s/.test(name)) {
+    // Sin puntos en iniciales
+    const noDotsInInitials = name.replace(/([A-Z])\./g, '$1');
+    if (!variants.includes(noDotsInInitials)) {
+      variants.push(noDotsInInitials);
+    }
+    
+    // Sin espacios después de iniciales
+    const noSpacesAfterInitials = name.replace(/([A-Z])\.\s+/g, '$1');
+    if (!variants.includes(noSpacesAfterInitials)) {
+      variants.push(noSpacesAfterInitials);
+    }
+  }
+  
+  // 5. Separar por palabras para búsqueda parcial de apellidos o nombres
+  const words = name.split(/\s+/);
+  if (words.length > 1) {
+    // Agregar palabras individuales que tengan al menos 3 caracteres
+    words.forEach(word => {
+      if (word.length >= 3 && !variants.includes(word)) {
+        variants.push(word);
+      }
+    });
+  }
+  
+  // Eliminar duplicados y vacíos
+  return [...new Set(variants)].filter(v => v);
 }
 
 /**
@@ -1543,11 +1795,20 @@ ACCIÓN REQUERIDA:
  *    - getProvinceIdDynamic() busca en el país correcto dinámicamente
  *    - Búsqueda exacta y parcial por nombre y código
  *    - Considera el país encontrado para búsqueda precisa
- * 
- * 5. BÚSQUEDA DE COMERCIALES:
- *    - getSalespersonId() busca comerciales en Odoo
- *    - Asigna automáticamente al campo user_id del lead
- *    - Búsqueda múltiple: nombre, login, partner, email
+ *  * 5. BÚSQUEDA DE COMERCIALES MEJORADA (NUEVA VERSIÓN):
+ *    - getSalespersonId() mejorado para considerar equipos de ventas
+ *    - Manejo avanzado de variantes de nombres (prepareNameVariants):
+ *      * Nombres con apóstrofes (D'Auria → DAuria, D Auria)
+ *      * Nombres con acentos (Martínez → Martinez)
+ *      * Nombres con formato invertido (Apellido, Nombre)
+ *      * Nombres con iniciales (J. Pérez)
+ *      * Nombres con guiones (Juan-Carlos)
+ *    - Proceso de búsqueda en tres pasos:
+ *      a) Primero busca equipos (crm.team) que coincidan con el nombre
+ *      b) Luego busca usuarios que sean miembros de equipos de venta
+ *      c) Finalmente cae de respaldo a la búsqueda tradicional de usuarios
+ *    - Prioriza líderes de equipo y miembros activos
+ *    - Mantiene búsqueda múltiple: nombre, login, partner, email
  * 
  * 6. FORMATO HTML EN DESCRIPCIÓN:
  *    - Notas internas formateadas como HTML con estilos profesionales
@@ -1561,8 +1822,20 @@ ACCIÓN REQUERIDA:
  * 
  * 8. FUNCIONES DE PRUEBA DISPONIBLES:
  *    - testNewFieldMappings(): Verifica mapeo de campos
- *    - testSalespersonSearch(): Prueba búsqueda de comerciales
- *    - testLocationSearch(): Prueba búsqueda dinámica de ubicación (NUEVA)
+ *    - testSalespersonSearch(): Prueba búsqueda general de comerciales
+ *    - testLocationSearch(): Prueba búsqueda dinámica de ubicación
+ *    - testSalesTeamSearch(): NUEVA prueba de búsqueda por equipos de venta
+ *  * FLUJO DE BÚSQUEDA DE COMERCIAL (NUEVO):
+ * 0. Generar variantes del nombre para mejorar la búsqueda (prepareNameVariants)
+ *    - Maneja nombres con apóstrofes, acentos, guiones, etc.
+ *    - Crea alternativas para aumentar probabilidades de coincidencia
+ * 1. Buscar equipos de venta (crm.team) con nombre similar (usando todas las variantes)
+ *    - Si encuentra equipo, devuelve líder o primer miembro activo
+ * 2. Buscar usuarios cuyo nombre coincida y verificar si pertenecen a equipos de venta
+ *    - Si encuentra usuario en equipo, lo devuelve
+ * 3. Búsqueda tradicional por nombre/email en todos los usuarios (usando todas las variantes)
+ *    - Si encuentra usuario, lo devuelve (incluso si no está en equipo de ventas)
+ * 4. Fallback a cualquier usuario disponible
  * 
  * FLUJO DE BÚSQUEDA DE UBICACIÓN:
  * 1. Analiza provincia → Si es argentina conocida → Retorna Argentina (ID: 10)
@@ -1573,11 +1846,13 @@ ACCIÓN REQUERIDA:
  * 
  * PRÓXIMOS PASOS PARA IMPLEMENTACIÓN:
  * 1. ✅ Corregir sintaxis y guardar script
- * 2. 🔧 Ejecutar testLocationSearch() para verificar búsqueda de ubicación
- * 3. 🔧 Ejecutar testNewFieldMappings() para verificar mapeos * 4. 🔧 Ejecutar testSalespersonSearch() para probar búsqueda
- * 5. 📊 Enlazar formulario con spreadsheet  
- * 6. ⚙️ Configurar trigger de envío automático
- * 7. 🧪 Probar con envío real del formulario
+ * 2. ✅ Implementar búsqueda mejorada por equipos de venta
+ * 3. 🔧 Ejecutar testSalesTeamSearch() para verificar búsqueda por equipos
+ * 4. 🔧 Ejecutar testLocationSearch() para verificar búsqueda de ubicación
+ * 5. 🔧 Ejecutar testSalespersonSearch() para verificar búsqueda genérica
+ * 6. 📊 Enlazar formulario con spreadsheet  
+ * 7. ⚙️ Configurar trigger de envío automático
+ * 8. 🧪 Probar con envío real del formulario
  */
 
 // ===============================
@@ -1683,69 +1958,187 @@ function testSalespersonSearch() {
 }
 
 /**
- * Test específico para búsqueda GLOBAL de comerciales (sin restricciones de empresa)
+ * Test específico para búsqueda de comerciales con equipos de ventas
  */
-function testGlobalSalespersonSearch() {
-  Logger.log("=== PRUEBA BÚSQUEDA GLOBAL DE COMERCIALES ===");
+function testSalesTeamSearch() {
+  Logger.log("=== PRUEBA BÚSQUEDA POR EQUIPOS DE VENTAS ===");
   
   try {
     // Autenticación
     const uid = xmlrpcLogin(ODOO_CONFIG.url, ODOO_CONFIG.db, ODOO_CONFIG.login, ODOO_CONFIG.password);
     Logger.log("✅ Autenticación exitosa con UID: " + uid);
     
-    // 1. Listar TODOS los usuarios sin filtros para ver qué hay disponible
-    Logger.log("\n--- PASO 1: Listando TODOS los usuarios disponibles ---");
-    const allUsers = xmlrpcExecute(
+    // 1. LISTAR TODOS LOS EQUIPOS DE VENTAS
+    Logger.log("\n--- PASO 1: Listando equipos de ventas disponibles ---");
+    const salesTeams = xmlrpcExecute(
       ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
-      'res.users',
+      'crm.team',
       'search_read',
-      [[], ['id', 'name', 'login', 'active', 'company_id', 'company_ids'], 0, 10],
+      [[], ['id', 'name', 'user_id', 'member_ids', 'company_id'], 0, 10],
       {}  // Context vacío
     );
     
-    if (allUsers && allUsers.length > 0) {
-      Logger.log(`📊 Total usuarios encontrados: ${allUsers.length}`);
-      allUsers.forEach((user, index) => {
-        Logger.log(`   ${index + 1}. ${user.name} (ID: ${user.id}, Login: ${user.login}, Activo: ${user.active})`);
-        Logger.log(`      Empresa actual: ${user.company_id || 'N/A'}, Empresas: ${user.company_ids || 'N/A'}`);
-      });
+    if (salesTeams && salesTeams.length > 0) {
+      Logger.log(`📊 Total equipos de ventas encontrados: ${salesTeams.length}`);
+      
+      for (const team of salesTeams) {
+        Logger.log(`\n   🏢 Equipo: "${team.name}" (ID: ${team.id})`);
+        
+        // Mostrar líder del equipo
+        if (team.user_id && team.user_id[0]) {
+          Logger.log(`      👑 Líder: ${team.user_id[1]} (ID: ${team.user_id[0]})`);
+        } else {
+          Logger.log(`      ❓ Sin líder definido`);
+        }
+        
+        // Mostrar miembros si hay alguno
+        if (team.member_ids && team.member_ids.length > 0) {
+          Logger.log(`      👥 Miembros: ${team.member_ids.length} usuario(s)`);
+          
+          // Obtener detalles de los miembros
+          const teamMembers = xmlrpcExecute(
+            ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
+            'res.users',
+            'search_read',
+            [[['id', 'in', team.member_ids]], ['id', 'name', 'active', 'login']],
+            {}
+          );
+          
+          if (teamMembers && teamMembers.length > 0) {
+            teamMembers.forEach((member, idx) => {
+              const activeStatus = member.active ? '✅' : '❌';
+              Logger.log(`         ${idx + 1}. ${member.name} (${activeStatus} ${member.login}, ID: ${member.id})`);
+            });
+          }
+        } else {
+          Logger.log(`      ❓ Sin miembros definidos`);
+        }
+        
+        // Mostrar empresa asociada
+        if (team.company_id && team.company_id[0]) {
+          Logger.log(`      🏭 Empresa: ${team.company_id[1]} (ID: ${team.company_id[0]})`);
+        }
+      }
     } else {
-      Logger.log("❌ No se encontraron usuarios");
+      Logger.log("❌ No se encontraron equipos de ventas");
     }
     
-    // 2. Pruebas de búsqueda específicas
-    const testNames = ["Admin", "admin", "Administrator", "Usuario", "Test"];
+    // 2. PROBAR BÚSQUEDA DE COMERCIALES POR NOMBRE DE EQUIPO
+    Logger.log("\n--- PASO 2: Probando búsqueda por nombres de equipos ---");
     
-    for (const testName of testNames) {
-      Logger.log(`\n--- PASO 2: Probando búsqueda de "${testName}" ---`);
-      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, testName);
+    // Si encontramos equipos, probar con esos nombres
+    const teamNamesToTest = salesTeams && salesTeams.length > 0 
+      ? salesTeams.map(team => team.name).slice(0, 3)  // Tomar hasta 3 nombres de equipos
+      : ["Ventas", "Sales", "Direct Sales"];  // Nombres genéricos si no hay equipos
+    
+    for (const teamName of teamNamesToTest) {
+      Logger.log(`\n   🔍 Probando búsqueda con nombre de equipo: "${teamName}"`);
+      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, teamName);
       
       if (foundUser) {
-        Logger.log(`✅ ÉXITO: Comercial "${testName}" encontrado con ID: ${foundUser}`);
+        Logger.log(`   ✅ ÉXITO: Se encontró usuario con ID: ${foundUser} para equipo "${teamName}"`);
       } else {
-        Logger.log(`❌ FALLO: No se encontró comercial "${testName}"`);
+        Logger.log(`   ❌ FALLO: No se encontró ningún usuario para equipo "${teamName}"`);
       }
     }
     
-    // 3. Verificar contexto de empresa actual
-    Logger.log("\n--- PASO 3: Verificando contexto de usuario actual ---");
-    const currentUser = xmlrpcExecute(
-      ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
-      'res.users',
-      'read',
-      [uid, ['name', 'company_id', 'company_ids']]
-    );
+    // 3. PROBAR BÚSQUEDA POR MIEMBROS DE EQUIPO
+    Logger.log("\n--- PASO 3: Probando búsqueda por nombres de miembros ---");
     
-    if (currentUser) {
-      Logger.log(`Usuario actual: ${currentUser.name}`);
-      Logger.log(`Empresa actual: ${currentUser.company_id || 'N/A'}`);
-      Logger.log(`Empresas accesibles: ${currentUser.company_ids || 'N/A'}`);
+    // Recopilar nombres de miembros y líderes
+    const memberNames = [];
+    
+    if (salesTeams && salesTeams.length > 0) {
+      for (const team of salesTeams) {
+        // Agregar líder si existe
+        if (team.user_id && team.user_id[1]) {
+          const leaderName = team.user_id[1];
+          if (!memberNames.includes(leaderName)) {
+            memberNames.push(leaderName);
+          }
+        }
+        
+        // Agregar miembros (recuperados anteriormente)
+        if (team.member_ids && team.member_ids.length > 0) {
+          const teamMembers = xmlrpcExecute(
+            ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password,
+            'res.users',
+            'search_read',
+            [[['id', 'in', team.member_ids]], ['id', 'name']],
+            {}
+          );
+          
+          if (teamMembers) {
+            teamMembers.forEach(member => {
+              if (!memberNames.includes(member.name)) {
+                memberNames.push(member.name);
+              }
+            });
+          }
+        }
+      }
     }
     
-    Logger.log("\n✅ PRUEBA DE BÚSQUEDA GLOBAL COMPLETADA");
+    // Si no encontramos nombres, usar algunos genéricos
+    if (memberNames.length === 0) {
+      memberNames.push("Admin", "Administrador", "Vendedor", "Sales Person");
+    }
+    
+    // Probar con los nombres encontrados (limitar a 5)
+    const namesToTest = memberNames.slice(0, 5);
+    for (const memberName of namesToTest) {
+      Logger.log(`\n   🔍 Probando búsqueda con nombre de miembro: "${memberName}"`);
+      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, memberName);
+      
+      if (foundUser) {
+        Logger.log(`   ✅ ÉXITO: Se encontró usuario con ID: ${foundUser} para nombre "${memberName}"`);
+      } else {
+        Logger.log(`   ❌ FALLO: No se encontró ningún usuario para nombre "${memberName}"`);
+      }
+    }
+      // 4. PROBAR BÚSQUEDA CON NOMBRES ESPECIALES
+    Logger.log("\n--- PASO 4: Probando búsqueda con nombres especiales ---");
+    const specialNames = [
+      "D'Auria",                // Nombre con apóstrofe
+      "Gonzalez, María",        // Nombre con coma
+      "J. Pérez",               // Inicial con punto
+      "Juan-Carlos Rodriguez",  // Nombre con guión
+      "O'Neill",                // Otro apóstrofe
+      "Martínez"                // Nombre con acento
+    ];
+    
+    for (const specialName of specialNames) {
+      Logger.log(`\n   🔍 Probando búsqueda con nombre especial: "${specialName}"`);
+      Logger.log(`   ℹ️ Variantes que se probarán: ${JSON.stringify(prepareNameVariants(specialName))}`);
+      
+      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, specialName);
+      
+      if (foundUser) {
+        Logger.log(`   ✅ ÉXITO: Se encontró usuario con ID: ${foundUser} para nombre "${specialName}"`);
+      } else {
+        Logger.log(`   ⚠️ No se encontró usuario para nombre "${specialName}" a pesar de las variantes`);
+      }
+    }
+    
+    // 5. PROBAR BÚSQUEDA POR NOMBRES INEXISTENTES
+    Logger.log("\n--- PASO 5: Probando búsqueda con nombres inexistentes ---");
+    const nonExistentNames = ["EquipoInexistente123", "UsuarioQueNoExiste456"];
+    
+    for (const fakeName of nonExistentNames) {
+      Logger.log(`\n   🔍 Probando búsqueda con nombre inexistente: "${fakeName}"`);
+      const foundUser = getSalespersonId(ODOO_CONFIG.url, ODOO_CONFIG.db, uid, ODOO_CONFIG.password, fakeName);
+      
+      if (foundUser) {
+        Logger.log(`   ⚠️ EXTRAÑO: Se encontró usuario con ID: ${foundUser} para nombre inexistente "${fakeName}"`);
+      } else {
+        Logger.log(`   ✅ ESPERADO: No se encontró usuario para nombre inexistente "${fakeName}"`);
+      }
+    }
+    
+    Logger.log("\n✅ PRUEBA DE BÚSQUEDA POR EQUIPOS DE VENTAS COMPLETADA");
     
   } catch (error) {
-    Logger.log("❌ Error en prueba global de comerciales: " + error.toString());
+    Logger.log("❌ Error en prueba de equipos de ventas: " + error.toString());
     Logger.log("🔧 Stack trace: " + error.stack);
   }
 }
